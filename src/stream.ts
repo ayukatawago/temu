@@ -4,13 +4,17 @@
 // tap/drag/scroll/back (input/mouse.ts + input/adbshell.ts) — the modal keyboard layer for
 // precise targeting (hjkl nudge, hint mode, text entry) lands in later milestones.
 
-import { ScreenrecordSource } from './device/capture.js';
+import { writeFile } from 'node:fs/promises';
+import { resolve as resolvePath } from 'node:path';
+import { captureScreencapPng, ScreenrecordSource } from './device/capture.js';
 import { getDeviceGeometry, pickDefaultDevice, type DeviceGeometry } from './device/discover.js';
 import { PngFrameSplitter } from './device/transcode.js';
 import { AdbShellInputBackend } from './input/adbshell.js';
 import type { InputBackend } from './input/backend.js';
+import { KeyboardHandler, type KeyboardMode } from './input/keymap.js';
 import { MouseTracker } from './input/mouse.js';
 import { detectCaps, queryCursorPosition, type CellPixelSize } from './render/caps.js';
+import { renderHelpOverlay, StatusBar } from './render/chrome.js';
 import {
   cellToDevicePixel,
   fitDeviceToCells,
@@ -137,7 +141,6 @@ function setUpMouse(
   origin: GridOrigin,
   getFit: () => FitResult,
   geometry: DeviceGeometry,
-  onInterrupt: () => void,
 ): MouseTracker {
   const toDevicePx = (col: number, row: number): { x: number; y: number } =>
     cellToDevicePixel(col, row, origin, getFit(), geometry.width, geometry.height);
@@ -172,8 +175,94 @@ function setUpMouse(
     onRightClick: () => {
       input.keyevent('KEYCODE_BACK');
     },
-    onInterrupt,
   });
+}
+
+const CROSSHAIR_BIG_STEP_MULTIPLIER = 5;
+const DEFAULT_FPS_CAP = 15;
+const MIN_FPS_CAP = 1;
+const MAX_FPS_CAP = 30;
+
+/**
+ * Wires the modal keyboard's commands up to the input backend, a crosshair position tracked in
+ * device pixels, the status bar, and the help overlay. Returns the handler plus a couple of
+ * accessors stream.ts's frame pipeline needs (current fps cap, whether help is showing).
+ */
+function setUpKeyboard(
+  input: InputBackend,
+  serial: string,
+  geometry: DeviceGeometry,
+  getFit: () => FitResult,
+  origin: GridOrigin,
+  renderer: KittyRenderer,
+  statusBar: StatusBar,
+  onQuit: () => void,
+): { keyboard: KeyboardHandler; getFpsCap: () => number; isHelpVisible: () => boolean } {
+  let crosshair = { x: Math.round(geometry.width / 2), y: Math.round(geometry.height / 2) };
+  let fpsCap = DEFAULT_FPS_CAP;
+  let helpVisible = false;
+  statusBar.setFps(fpsCap);
+  statusBar.setCrosshair(crosshair);
+
+  const keyboard = new KeyboardHandler({
+    onQuit,
+    onMoveCrosshair: (dx, dy, big) => {
+      const fit = getFit();
+      const multiplier = big ? CROSSHAIR_BIG_STEP_MULTIPLIER : 1;
+      const stepX = Math.max(1, Math.round(geometry.width / fit.cols)) * multiplier;
+      const stepY = Math.max(1, Math.round(geometry.height / fit.rows)) * multiplier;
+      crosshair = {
+        x: Math.min(geometry.width - 1, Math.max(0, crosshair.x + dx * stepX)),
+        y: Math.min(geometry.height - 1, Math.max(0, crosshair.y + dy * stepY)),
+      };
+      statusBar.setCrosshair(crosshair);
+    },
+    onTapCrosshair: () => {
+      input.tap(crosshair.x, crosshair.y);
+    },
+    onBack: () => input.keyevent('KEYCODE_BACK'),
+    onHome: () => input.keyevent('KEYCODE_HOME'),
+    onRecents: () => input.keyevent('KEYCODE_APP_SWITCH'),
+    onPower: () => input.keyevent('KEYCODE_POWER'),
+    onVolumeUp: () => input.keyevent('KEYCODE_VOLUME_UP'),
+    onVolumeDown: () => input.keyevent('KEYCODE_VOLUME_DOWN'),
+    onScreenshot: (announcePath) => {
+      const filename = `temu-screenshot-${new Date().toISOString().replaceAll(/[:.]/g, '-')}.png`;
+      const fullPath = resolvePath(filename);
+      captureScreencapPng(serial)
+        .then((png) => writeFile(fullPath, png))
+        .then(() => {
+          statusBar.showToast(announcePath ? `saved: ${fullPath}` : `saved: ${filename}`, 4000);
+        })
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          statusBar.showToast(`screenshot failed: ${message}`, 4000);
+        });
+    },
+    onFpsDelta: (delta) => {
+      fpsCap = Math.min(MAX_FPS_CAP, Math.max(MIN_FPS_CAP, fpsCap + delta));
+      statusBar.setFps(fpsCap);
+    },
+    onToggleHelp: () => {
+      helpVisible = !helpVisible;
+      const fit = getFit();
+      if (helpVisible) {
+        renderHelpOverlay(origin.row, origin.col, fit.cols, fit.rows);
+      } else {
+        // Forces the placeholder grid to be redrawn on the next frame, which overwrites the
+        // help text sitting in the same cells.
+        renderer.resize(fit.cols, fit.rows);
+      }
+    },
+    onModeChange: (mode: KeyboardMode) => {
+      statusBar.setMode(mode);
+    },
+    onTextChar: (chars) => input.text(chars),
+    onTextBackspace: () => input.keyevent('KEYCODE_DEL'),
+    onTextEnter: () => input.keyevent('KEYCODE_ENTER'),
+  });
+
+  return { keyboard, getFpsCap: () => fpsCap, isHelpVisible: () => helpVisible };
 }
 
 export async function runStream(argv: string[]): Promise<number> {
@@ -230,8 +319,25 @@ export async function runStream(argv: string[]): Promise<number> {
   const dropFrame = frameDropper(renderer, (error: unknown) => {
     console.error('render error:', error);
   });
+  const statusBar = new StatusBar(gridOrigin.row + fit.rows, fit.cols);
 
-  let pipeline = new Pipeline(serial, fit.capturePx, options.bitrate, dropFrame, (message) => {
+  // Frame-rate cap and the help overlay both gate frames before they ever reach dropFrame:
+  // capturing/transcoding keep running regardless (there's no cheap way to pause screenrecord),
+  // this just decides whether a given decoded frame is worth spending a render on.
+  let lastRenderedAt = 0;
+  const onCaptureFrame = (png: Buffer): void => {
+    if (isHelpVisible()) {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastRenderedAt < 1000 / getFpsCap()) {
+      return;
+    }
+    lastRenderedAt = now;
+    dropFrame(png);
+  };
+
+  let pipeline = new Pipeline(serial, fit.capturePx, options.bitrate, onCaptureFrame, (message) => {
     console.error(message);
   });
 
@@ -253,8 +359,9 @@ export async function runStream(argv: string[]): Promise<number> {
       }
       fit = nextFit;
       renderer.resize(fit.cols, fit.rows);
+      statusBar.resize(gridOrigin.row + fit.rows, fit.cols);
       pipeline.stop();
-      pipeline = new Pipeline(serial, fit.capturePx, options.bitrate, dropFrame, (message) => {
+      pipeline = new Pipeline(serial, fit.capturePx, options.bitrate, onCaptureFrame, (message) => {
         console.error(message);
       });
     }, RESIZE_DEBOUNCE_MS);
@@ -279,6 +386,7 @@ export async function runStream(argv: string[]): Promise<number> {
     }
     process.stdin.off('data', onStdinData);
     process.stdin.pause();
+    statusBar.dispose();
     input.dispose();
     pipeline.stop();
     renderer.dispose();
@@ -292,9 +400,22 @@ export async function runStream(argv: string[]): Promise<number> {
   process.once('SIGINT', quit);
   process.once('SIGTERM', quit);
 
-  const mouseTracker = setUpMouse(input, gridOrigin, () => fit, geometry, quit);
+  const mouseTracker = setUpMouse(input, gridOrigin, () => fit, geometry);
+  const { keyboard, getFpsCap, isHelpVisible } = setUpKeyboard(
+    input,
+    serial,
+    geometry,
+    () => fit,
+    gridOrigin,
+    renderer,
+    statusBar,
+    quit,
+  );
   const onStdinData = (chunk: Buffer): void => {
-    mouseTracker.feed(chunk);
+    const leftover = mouseTracker.feed(chunk);
+    if (leftover.length > 0) {
+      keyboard.feed(leftover);
+    }
   };
 
   mouseTracker.enable();

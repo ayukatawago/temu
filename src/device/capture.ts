@@ -97,7 +97,8 @@ export class ScreenrecordSource extends EventEmitter {
   }
 }
 
-function captureScreencapPng(serial: string): Promise<Buffer> {
+/** Also used directly for the `s`/`S` screenshot keybinding, not just the polling fallback. */
+export function captureScreencapPng(serial: string): Promise<Buffer> {
   return new Promise((resolveCap, rejectCap) => {
     const child = spawn('adb', ['-s', serial, 'exec-out', 'screencap', '-p'], {
       stdio: ['ignore', 'pipe', 'pipe'],

@@ -13,12 +13,6 @@ export interface MouseHandlers {
   onDragEnd: (col: number, row: number) => void;
   onWheel: (direction: 'up' | 'down', col: number, row: number) => void;
   onRightClick: (col: number, row: number) => void;
-  /**
-   * Putting stdin into raw mode (required to read mouse reports byte-by-byte) disables the
-   * terminal's own Ctrl+C-to-SIGINT handling, so this reimplements it and hands back control
-   * here rather than swallowing it.
-   */
-  onInterrupt: () => void;
 }
 
 export const ENABLE_MOUSE_TRACKING = '\x1b[?1000h\x1b[?1002h\x1b[?1006h';
@@ -49,23 +43,26 @@ export class MouseTracker {
     process.stdout.write(DISABLE_MOUSE_TRACKING);
   }
 
-  /** Feed a raw chunk of stdin bytes read while mouse tracking is enabled. */
-  feed(chunk: Buffer): void {
+  /**
+   * Feed a raw chunk of stdin bytes read while mouse tracking is enabled. Returns whatever
+   * wasn't consumed as a mouse report (in latin1 — a byte-for-byte view, since a keyboard's
+   * escape sequences are all in the printable-ASCII/control-byte range anyway), for the
+   * keyboard layer to decode.
+   */
+  feed(chunk: Buffer): Buffer {
     let text = chunk.toString('latin1');
+    let leftover = '';
     for (;;) {
       const match = SGR_MOUSE_PATTERN.exec(text);
       if (!match) {
+        leftover += text;
         break;
       }
+      leftover += text.slice(0, match.index);
       this.handleReport(match);
       text = text.slice(match.index + match[0].length);
     }
-    // Anything left over that isn't a mouse report is silently dropped for now — the modal
-    // keyboard layer (a later milestone) takes over decoding the rest of stdin. Ctrl+C is the
-    // one exception: raw mode means the terminal no longer turns it into SIGINT for us.
-    if (text.includes('\x03')) {
-      this.handlers.onInterrupt();
-    }
+    return Buffer.from(leftover, 'latin1');
   }
 
   private handleReport(match: RegExpExecArray): void {
