@@ -134,3 +134,49 @@ export class PngFrameSplitter extends EventEmitter {
     this.ffmpeg.kill();
   }
 }
+
+/**
+ * Scales a standalone PNG (e.g. a `screencap` snapshot used to seed the view or paper over a
+ * stalled live frame) to the exact pixel size the live pipeline is currently rendering at.
+ *
+ * Matters more than it looks: `screencap` always returns the device's full native resolution,
+ * a different (and differently-rounded) aspect ratio than `fitDeviceToCells`' pixel-perfect fit
+ * for the current pane. Displaying it unscaled — even though Kitty stretches any image into the
+ * same cell box regardless of its native size — showed up as a visible squish/resize each time
+ * the view swapped between a screencap frame and a live one. Scaling to the identical target
+ * size first makes the swap invisible.
+ */
+export function scalePng(png: Buffer, width: number, height: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn(
+      'ffmpeg',
+      [
+        '-f',
+        'image2pipe',
+        '-i',
+        'pipe:0',
+        '-vf',
+        `scale=${String(width)}:${String(height)}`,
+        '-f',
+        'image2pipe',
+        '-vcodec',
+        'png',
+        'pipe:1',
+      ],
+      { stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    const chunks: Buffer[] = [];
+    ffmpeg.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+    ffmpeg.stdin.on('error', () => undefined);
+    ffmpeg.on('error', reject);
+    ffmpeg.on('exit', (code) => {
+      if (code !== 0) {
+        reject(new Error(`ffmpeg scale exited with code ${String(code)}`));
+        return;
+      }
+      resolve(Buffer.concat(chunks));
+    });
+    ffmpeg.stdin.write(png);
+    ffmpeg.stdin.end();
+  });
+}

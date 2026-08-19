@@ -8,7 +8,7 @@ import { writeFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
 import { captureScreencapPng, ScreenrecordSource } from './device/capture.js';
 import { getDeviceGeometry, pickDefaultDevice, type DeviceGeometry } from './device/discover.js';
-import { PngFrameSplitter } from './device/transcode.js';
+import { PngFrameSplitter, scalePng } from './device/transcode.js';
 import { AdbShellInputBackend } from './input/adbshell.js';
 import type { InputBackend } from './input/backend.js';
 import {
@@ -236,6 +236,12 @@ const MIN_FPS_CAP = 1;
 const MAX_FPS_CAP = 15;
 /** Zoom shows 1/ZOOM_FACTOR of the device's width and height, magnified to fill the same grid. */
 const ZOOM_FACTOR = 3;
+/**
+ * How long the live H.264 pipeline can go without producing a new frame before it's treated as
+ * stuck and a corrective `screencap` is taken instead — see the staleness-watchdog note in
+ * runStream for why this is needed even after the fps-cap/screencap-seeding fixes.
+ */
+const STALE_FRAME_THRESHOLD_MS = 1500;
 
 export interface KeyboardSetup {
   keyboard: KeyboardHandler;
@@ -473,20 +479,97 @@ export async function runStream(argv: string[]): Promise<number> {
   });
   const statusBar = new StatusBar(gridOrigin.row + fit.rows, fit.cols);
 
-  // Frame-rate cap and the help/hint overlays all gate frames before they ever reach dropFrame:
+  // Seed the pane with a real snapshot immediately. Verified empirically (feeding ffmpeg's
+  // decoder controlled bursts of NAL units through a pipe, with and without a live tap):
+  // screenrecord's H.264 stream can sit fully decoded-but-unflushed inside ffmpeg for many
+  // seconds on a genuinely idle screen — no amount of -fflags/-avioflags/-fpsprobesize tuning
+  // gets it to emit before it either receives a steady trickle of new packets or the process
+  // ends. Motion (e.g. a tap) supplies that trickle, which is why the pane used to stay blank
+  // until the user interacted with it. A one-shot screencap bypasses the whole H.264 pipeline
+  // and shows the actual current screen right away; the live stream overwrites it as soon as
+  // it manages to produce its own first frame. Scaled to the exact size the live pipeline
+  // renders at — screencap's native resolution has a different aspect-ratio rounding than
+  // fitDeviceToCells' pane-pixel-perfect fit, and displaying it as-is showed up as a visible
+  // squish/resize the moment the live stream's first (correctly-sized) frame replaced it.
+  captureScreencapPng(serial)
+    .then((png) => scalePng(png, fit.capturePx.width, fit.capturePx.height))
+    .then((png) => dropFrame(png))
+    .catch(() => undefined);
+
+  // Frame-rate cap and the help/hint overlays gate frames before they ever reach dropFrame:
   // capturing/transcoding keep running regardless (there's no cheap way to pause screenrecord),
   // this just decides whether a given decoded frame is worth spending a render on.
-  let lastRenderedAt = 0;
+  //
+  // Deliberately renders whichever frame is newest *at tick time*, not whichever happens to
+  // arrive right as the previous throttle window ends. That distinction matters after an idle
+  // period: ffmpeg's decoder can stall for seconds on a static screen (see the screencap-seeding
+  // note above) and then release its entire backlog in one burst once motion resumes. A gate
+  // that just checks "has enough time passed since the last render" accepts the first backlog
+  // frame it sees and then works through the rest of the backlog one throttle-interval at a
+  // time — which looks like several seconds of stale, already-outdated frames before the view
+  // catches up to the present. Keeping only the latest received frame and discarding the rest
+  // jumps straight to "now" the moment the backlog arrives, instead of replaying through it.
+  let latestFrame: Buffer | null = null;
+  let lastLiveFrameAt = Date.now();
+  // Cleared whenever a genuine live frame arrives; set once a stillness period has already been
+  // corrected. Without this, a screen that stays static forever would get re-"corrected" every
+  // STALE_FRAME_THRESHOLD_MS indefinitely — each one a full-resolution decode, visible as a
+  // repeating flash/rescale — instead of exactly once per stillness period.
+  let correctedThisStillPeriod = false;
   const onCaptureFrame = (png: Buffer): void => {
-    if (isHelpVisible() || isHintActive()) {
+    latestFrame = png;
+    lastLiveFrameAt = Date.now();
+    correctedThisStillPeriod = false;
+  };
+
+  // Staleness watchdog: the live pipeline can go quiet indefinitely on a screen that changes
+  // once and then holds still — e.g. a popup that appears and then just sits there. That last
+  // "settled" frame is exactly the kind ffmpeg's decoder tends to hold back (see the
+  // screencap-seeding note above for why): motion is what pushes buffered frames out, and a
+  // popup produces one change followed by no motion at all, so the pre-popup frame can simply
+  // stay on screen forever with nothing to dislodge it. If no new live frame has arrived in
+  // STALE_FRAME_THRESHOLD_MS, take one corrective `screencap` — cheap, always accurate, and
+  // bypasses the H.264 pipeline entirely — so the view can't drift for longer than that. Only
+  // one correction per stillness period: onCaptureFrame clears the flag again as soon as the
+  // live pipeline produces a genuinely new frame.
+  let screencapInFlight = false;
+  const refreshFromScreencapIfStale = (): void => {
+    if (screencapInFlight || correctedThisStillPeriod || zoomRegion) {
+      // A screencap is a full, unzoomed frame — showing one while zoomed in would flash the
+      // view back out to full-screen, which is worse than a brief stale frame.
       return;
     }
-    const now = Date.now();
-    if (now - lastRenderedAt < 1000 / getFpsCap()) {
+    if (Date.now() - lastLiveFrameAt < STALE_FRAME_THRESHOLD_MS) {
       return;
     }
-    lastRenderedAt = now;
-    dropFrame(png);
+    screencapInFlight = true;
+    captureScreencapPng(serial)
+      .then((png) => scalePng(png, fit.capturePx.width, fit.capturePx.height))
+      .then((png) => {
+        latestFrame = png;
+        correctedThisStillPeriod = true;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        screencapInFlight = false;
+      });
+  };
+
+  let renderTickTimer: NodeJS.Timeout | null = null;
+  // Not started here: it closes over getFpsCap/isHelpVisible/isHintActive, which don't exist
+  // until setUpKeyboard runs further down — started there instead.
+  const scheduleRenderTick = (): void => {
+    renderTickTimer = setTimeout(() => {
+      if (!isHelpVisible() && !isHintActive()) {
+        refreshFromScreencapIfStale();
+        if (latestFrame) {
+          const frame = latestFrame;
+          latestFrame = null;
+          dropFrame(frame);
+        }
+      }
+      scheduleRenderTick();
+    }, 1000 / getFpsCap());
   };
 
   // Zoom restarts the whole pipeline at full native capture resolution with a crop, rather than
@@ -559,6 +642,9 @@ export async function runStream(argv: string[]): Promise<number> {
     if (resizeTimer) {
       clearTimeout(resizeTimer);
     }
+    if (renderTickTimer) {
+      clearTimeout(renderTickTimer);
+    }
     process.stdout.off('resize', handleResize);
     mouseTracker.disable();
     if (process.stdin.isTTY) {
@@ -609,6 +695,7 @@ export async function runStream(argv: string[]): Promise<number> {
     quit,
     onZoomRequested,
   );
+  scheduleRenderTick();
   const onStdinData = (chunk: Buffer): void => {
     const leftover = mouseTracker.feed(chunk);
     if (leftover.length > 0) {
