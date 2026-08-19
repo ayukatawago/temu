@@ -22,11 +22,21 @@ export const DISABLE_MOUSE_TRACKING = '\x1b[?1006l\x1b[?1002l\x1b[?1000l';
 // eslint-disable-next-line no-control-regex -- matching a real SGR mouse report from the terminal
 const SGR_MOUSE_PATTERN = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/;
 
+// Matches a *trailing* fragment that could still grow into a full SGR_MOUSE_PATTERN match once
+// more bytes arrive — used to hold back a split report across feed() calls instead of shipping
+// half of it to the keyboard layer as garbage. A short (9-13 byte) escape sequence can easily
+// land split across two separate stdin 'data' events; unlike KeyboardHandler (which buffers
+// incomplete CSI sequences across calls for exactly this reason), this previously had no such
+// buffering at all, silently dropping any report that happened to split this way.
+// eslint-disable-next-line no-control-regex -- matching a real (partial) escape sequence
+const SGR_MOUSE_PARTIAL_SUFFIX = /\x1b(\[(<(\d+(;(\d+(;\d*)?)?)?)?)?)?$/;
+
 type ArmedState = { col: number; row: number } | null;
 
 export class MouseTracker {
   private armed: ArmedState = null;
   private dragging = false;
+  private pending = '';
 
   constructor(private readonly handlers: MouseHandlers) {}
 
@@ -50,12 +60,19 @@ export class MouseTracker {
    * keyboard layer to decode.
    */
   feed(chunk: Buffer): Buffer {
-    let text = chunk.toString('latin1');
+    let text = this.pending + chunk.toString('latin1');
+    this.pending = '';
     let leftover = '';
     for (;;) {
       const match = SGR_MOUSE_PATTERN.exec(text);
       if (!match) {
-        leftover += text;
+        const partial = SGR_MOUSE_PARTIAL_SUFFIX.exec(text);
+        if (partial) {
+          leftover += text.slice(0, partial.index);
+          this.pending = text.slice(partial.index);
+        } else {
+          leftover += text;
+        }
         break;
       }
       leftover += text.slice(0, match.index);

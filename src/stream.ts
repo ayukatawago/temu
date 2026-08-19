@@ -164,9 +164,19 @@ function frameDropper(renderer: FrameRenderer, onError: (error: unknown) => void
   };
 }
 
-function currentAvailableCells(): { cols: number; rows: number } {
+/**
+ * `originRow` (1-based) is however many rows are already consumed above the grid — the startup
+ * banner, typically — which must be subtracted here too, not just STATUS_BAR_ROWS below it.
+ * Getting this wrong means the grid plus status bar overflow the pane's actual height, which
+ * forces a scroll the moment they're printed — silently invalidating gridOrigin (captured right
+ * before that print, under the assumption that nothing would move the viewport afterward) and
+ * breaking every mouse coordinate computed from it. Found via exactly that symptom: real clicks
+ * at every row consistently mapped to the same near-zero device Y.
+ */
+function currentAvailableCells(originRow: number): { cols: number; rows: number } {
   const cols = process.stdout.columns ?? 80;
-  const rows = Math.max(1, (process.stdout.rows ?? 24) - STATUS_BAR_ROWS);
+  const totalRows = process.stdout.rows ?? 24;
+  const rows = Math.max(1, totalRows - (originRow - 1) - STATUS_BAR_ROWS);
   return { cols, rows };
 }
 
@@ -430,20 +440,30 @@ export async function runStream(argv: string[]): Promise<number> {
   }
   const cellSize: CellPixelSize = caps.cellSize;
 
-  const { cols: startCols, rows: startRows } = currentAvailableCells();
-  let fit = fitDeviceToCells(startCols, startRows, geometry.width, geometry.height, cellSize);
+  // Clears the *screen* (not scrollback — prior output stays reachable by scrolling up) and
+  // homes the cursor, so gridOrigin below always lands near row 1 regardless of how much was
+  // already in the pane. Without this, a pane with a long scrollback of prior shell output
+  // pushes the origin far down, which starves currentAvailableCells() of rows for no reason —
+  // the grid doesn't need to coexist with old output, it just needs a predictable starting
+  // point. Plain ANSI, not passthrough-wrapped: tmux understands clear-screen/cursor-home
+  // natively.
+  process.stdout.write('\x1b[2J\x1b[H');
 
+  // Deliberately no cell-size/grid-dimensions mention here: those depend on knowing gridOrigin
+  // first (see currentAvailableCells' doc comment), and gridOrigin has to be queried as the
+  // *last* thing printed before the grid itself — anything printed after the query but before
+  // the grid draws would shift the viewport and invalidate it right away.
   console.log(
-    `temu — streaming ${serial} (${String(geometry.width)}x${String(geometry.height)}) ` +
-      `at ${String(fit.cols)}x${String(fit.rows)} cells. Ctrl+C to quit.\n`,
+    `temu — streaming ${serial} (${String(geometry.width)}x${String(geometry.height)}). Ctrl+C to quit.\n`,
   );
 
-  // Queried right before the renderer draws its placeholder grid at the current cursor
-  // position, so mouse reports (also absolute-viewport coordinates) can be mapped back to a
-  // position within the grid. Falls back to assuming the top-left corner of the terminal if the
-  // terminal doesn't answer in time — mouse targeting would be off, but nothing crashes.
+  // Falls back to assuming the top-left corner of the terminal if the terminal doesn't answer
+  // in time — mouse targeting would be off, but nothing crashes.
   const cursorPosition = await queryCursorPosition();
   const gridOrigin: GridOrigin = cursorPosition ?? { row: 1, col: 1 };
+
+  const { cols: startCols, rows: startRows } = currentAvailableCells(gridOrigin.row);
+  let fit = fitDeviceToCells(startCols, startRows, geometry.width, geometry.height, cellSize);
 
   const renderer: FrameRenderer = useBlocks
     ? new BlocksRenderer({ cols: fit.cols, rows: fit.rows })
@@ -501,7 +521,7 @@ export async function runStream(argv: string[]): Promise<number> {
       clearTimeout(resizeTimer);
     }
     resizeTimer = setTimeout(() => {
-      const { cols, rows } = currentAvailableCells();
+      const { cols, rows } = currentAvailableCells(gridOrigin.row);
       const nextFit = fitDeviceToCells(cols, rows, geometry.width, geometry.height, cellSize);
       if (
         nextFit.cols === fit.cols &&
