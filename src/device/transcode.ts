@@ -16,6 +16,16 @@ export interface TranscodeOptions {
    * scaling the crop back up would just look blurrier, not more detailed.
    */
   crop?: { x: number; y: number; width: number; height: number };
+  /**
+   * Caps ffmpeg's own output rate via its `fps` filter, applied before crop/scale. Without this,
+   * ffmpeg fully decodes and PNG-encodes every frame screenrecord delivers (content-driven, up to
+   * its native ~25fps during real motion — see device/capture.ts), even though a fps-capping
+   * consumer downstream only ever uses a fraction of them. That's wasted work competing with
+   * input handling on the same single-threaded event loop; capping it here instead of discarding
+   * after the fact measurably reduces total CPU and data volume (verified: an ~21fps motion clip
+   * dropped to ~7fps of *actual PNG-encoded output* with `fps=8`, not just fewer frames used).
+   */
+  fps?: number;
 }
 
 // A PNG's IEND chunk always has zero-length data, so its bytes are fixed: a 4-byte length of 0,
@@ -37,12 +47,16 @@ export class PngFrameSplitter extends EventEmitter {
 
   constructor(input: Readable, options: TranscodeOptions) {
     super();
-    const filters = options.crop
-      ? [
-          `crop=${String(options.crop.width)}:${String(options.crop.height)}:${String(options.crop.x)}:${String(options.crop.y)}`,
-          `scale=${String(options.width)}:${String(options.height)}`,
-        ]
-      : [`scale=${String(options.width)}:${String(options.height)}`];
+    const filters: string[] = [];
+    if (options.fps) {
+      filters.push(`fps=${String(options.fps)}`);
+    }
+    if (options.crop) {
+      filters.push(
+        `crop=${String(options.crop.width)}:${String(options.crop.height)}:${String(options.crop.x)}:${String(options.crop.y)}`,
+      );
+    }
+    filters.push(`scale=${String(options.width)}:${String(options.height)}`);
 
     this.ffmpeg = spawn(
       'ffmpeg',
@@ -54,6 +68,18 @@ export class PngFrameSplitter extends EventEmitter {
         // baseline-profile output has no B-frames to reorder) decodes correctly.
         '-flags',
         'low_delay',
+        // `-max_ts_probe 1` is the fix for a serious live-streaming bug found by tracing
+        // ffmpeg's own debug log: a raw H.264 Annex-B stream has no container-level
+        // timestamps, so avformat_find_stream_info()'s generic "wait for the first
+        // timestamp" logic keeps reading packets up to its default cap of 50 before ever
+        // producing a single output frame. Against this project's content-driven capture
+        // (near-zero new data while the screen is static — see ScreenrecordSource's own
+        // doc comment), reaching 50 real frames could take many seconds of active use,
+        // which reads as "the view is dead / not synced". Verified end to end: stream info
+        // now completes ~0.5s after motion starts (not 50 frames in), across five separate
+        // motion bursts over an 18s session, each producing frames within ~1-2s.
+        '-max_ts_probe',
+        '1',
         '-f',
         'h264',
         '-i',

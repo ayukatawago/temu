@@ -24,6 +24,14 @@ export interface KittyRendererOptions {
    * project doesn't ping-pong between two ids.
    */
   imageId?: number;
+  /**
+   * Placement id used for every frame (default 1). The spec's "replace without flicker"
+   * guarantee is explicitly keyed on *both* the image id and the placement id matching — "If you
+   * send two placements with the same image id and placement id the second one will replace the
+   * first." Leaving this unset (placement id 0) is documented to instead risk creating a new,
+   * separate placement on every call. A stable, explicit id removes that ambiguity.
+   */
+  placementId?: number;
 }
 
 function assertWithinDiacriticRange(cols: number, rows: number): void {
@@ -44,6 +52,7 @@ function assertWithinDiacriticRange(cols: number, rows: number): void {
  */
 export class KittyRenderer {
   private readonly imageId: number;
+  private readonly placementId: number;
   private cols: number;
   private rows: number;
   private placeholderDrawn = false;
@@ -55,6 +64,7 @@ export class KittyRenderer {
     this.cols = options.cols;
     this.rows = options.rows;
     this.imageId = options.imageId ?? 1;
+    this.placementId = options.placementId ?? 1;
   }
 
   /** Changes the display size, forcing the placeholder grid to be redrawn on the next frame. */
@@ -101,7 +111,7 @@ export class KittyRenderer {
     await writeFile(tempFile, png);
 
     const payload = Buffer.from(resolve(tempFile), 'utf8').toString('base64');
-    const controlData = `a=T,i=${this.imageId},U=1,c=${this.cols},r=${this.rows},f=100,t=t,q=2`;
+    const controlData = `a=T,i=${this.imageId},p=${this.placementId},U=1,c=${this.cols},r=${this.rows},f=100,t=t,q=2`;
     writeToTerminal(`\x1b_G${controlData};${payload}\x1b\\`);
 
     // The protocol requires the terminal to delete t=t files itself after reading them, but

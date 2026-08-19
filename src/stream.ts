@@ -66,6 +66,8 @@ export interface PipelineOptions {
    * an already-downscaled capture.
    */
   crop?: { x: number; y: number; width: number; height: number };
+  /** Caps ffmpeg's own encode rate — see TranscodeOptions.fps for why this matters. */
+  fps: number;
 }
 
 /**
@@ -104,6 +106,7 @@ class Pipeline {
     const splitter = new PngFrameSplitter(this.capture.h264, {
       width: this.options.outputPx.width,
       height: this.options.outputPx.height,
+      fps: this.options.fps,
       ...(this.options.crop ? { crop: this.options.crop } : {}),
     });
     splitter.on('frame', this.onFrame);
@@ -214,9 +217,13 @@ function setUpMouse(
 }
 
 const CROSSHAIR_BIG_STEP_MULTIPLIER = 5;
-const DEFAULT_FPS_CAP = 15;
+// Deliberately conservative: each displayed frame costs a disk write (Kitty's t=t transmission)
+// and a terminal-side PNG decode, on top of ffmpeg's own decode+encode — this pipeline isn't
+// aiming for video frame rates, and pushing it higher visibly costs input responsiveness (see
+// MAX_FPS_CAP's use as ffmpeg's own encode-rate ceiling below, in buildPipelineOptions).
+const DEFAULT_FPS_CAP = 8;
 const MIN_FPS_CAP = 1;
-const MAX_FPS_CAP = 30;
+const MAX_FPS_CAP = 15;
 /** Zoom shows 1/ZOOM_FACTOR of the device's width and height, magnified to fill the same grid. */
 const ZOOM_FACTOR = 3;
 
@@ -465,14 +472,18 @@ export async function runStream(argv: string[]): Promise<number> {
   // Zoom restarts the whole pipeline at full native capture resolution with a crop, rather than
   // cropping the already-downscaled normal capture — see PipelineOptions' doc comment for why.
   let zoomRegion: ZoomRegion | null = null;
+  // ffmpeg is always capped at MAX_FPS_CAP regardless of the *current* display fps (adjustable
+  // live via +/- without a restart) — this only bounds the worst case of wasted encode work,
+  // never the user's chosen display rate, and MAX_FPS_CAP is the highest that rate can ever be.
   const buildPipelineOptions = (): PipelineOptions =>
     zoomRegion
       ? {
           capturePx: { width: geometry.width, height: geometry.height },
           outputPx: fit.capturePx,
           crop: zoomRegion,
+          fps: MAX_FPS_CAP,
         }
-      : { capturePx: fit.capturePx, outputPx: fit.capturePx };
+      : { capturePx: fit.capturePx, outputPx: fit.capturePx, fps: MAX_FPS_CAP };
 
   let pipeline = new Pipeline(
     serial,
