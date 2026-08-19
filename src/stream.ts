@@ -19,6 +19,7 @@ import {
 } from './input/hints.js';
 import { KeyboardHandler, type KeyboardMode } from './input/keymap.js';
 import { MouseTracker } from './input/mouse.js';
+import { BlocksRenderer } from './render/blocks.js';
 import { detectCaps, queryCursorPosition, type CellPixelSize } from './render/caps.js';
 import { renderHelpOverlay, StatusBar } from './render/chrome.js';
 import {
@@ -123,7 +124,14 @@ class Pipeline {
   }
 }
 
-function frameDropper(renderer: KittyRenderer, onError: (error: unknown) => void) {
+/** Whichever renderer is active — KittyRenderer or the block-character fallback — implements this. */
+export interface FrameRenderer {
+  resize(cols: number, rows: number): void;
+  renderFramePng(png: Buffer): Promise<void>;
+  dispose(): void;
+}
+
+function frameDropper(renderer: FrameRenderer, onError: (error: unknown) => void) {
   let inFlight = false;
   let pending: Buffer | null = null;
 
@@ -232,7 +240,7 @@ function setUpKeyboard(
   geometry: DeviceGeometry,
   getFit: () => FitResult,
   origin: GridOrigin,
-  renderer: KittyRenderer,
+  renderer: FrameRenderer,
   statusBar: StatusBar,
   onQuit: () => void,
   onZoomRequested: (centerX: number, centerY: number) => void,
@@ -399,11 +407,17 @@ export async function runStream(argv: string[]): Promise<number> {
   }
 
   const caps = await detectCaps();
-  if (caps.kittyGraphicsSupported === false) {
-    console.error('This terminal does not appear to support Kitty graphics. Run `temu doctor`.');
-    return 1;
-  }
-  if (caps.insideTmux && caps.tmuxAllowPassthrough !== 'on') {
+  // 'unknown' (heuristic couldn't tell) is treated optimistically — try Kitty graphics anyway.
+  // Only a confirmed 'false' falls back, since the fallback is a real quality trade-off.
+  const useBlocks = caps.kittyGraphicsSupported === false;
+  if (useBlocks) {
+    console.error(
+      'Kitty graphics not detected — falling back to a lower-quality block-character ' +
+        'renderer. Run `temu doctor` for details.',
+    );
+  } else if (caps.insideTmux && caps.tmuxAllowPassthrough !== 'on') {
+    // Only relevant to the Kitty path: the block renderer is plain text/SGR, which tmux
+    // understands natively and needs no passthrough at all.
     console.error('tmux allow-passthrough is off. Run `temu doctor --fix` first.');
     return 1;
   }
@@ -424,7 +438,9 @@ export async function runStream(argv: string[]): Promise<number> {
   const cursorPosition = await queryCursorPosition();
   const gridOrigin: GridOrigin = cursorPosition ?? { row: 1, col: 1 };
 
-  const renderer = new KittyRenderer({ cols: fit.cols, rows: fit.rows });
+  const renderer: FrameRenderer = useBlocks
+    ? new BlocksRenderer({ cols: fit.cols, rows: fit.rows })
+    : new KittyRenderer({ cols: fit.cols, rows: fit.rows });
   const dropFrame = frameDropper(renderer, (error: unknown) => {
     console.error('render error:', error);
   });
