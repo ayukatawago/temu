@@ -172,6 +172,35 @@ export async function queryCellPixelSize(timeoutMs = 400): Promise<CellPixelSize
   return result ?? null;
 }
 
+export interface CursorPosition {
+  /** 1-based, absolute within the terminal viewport (not the pane's scrollback). */
+  row: number;
+  col: number;
+}
+
+/**
+ * Queries the cursor's current position via the standard DSR request (`CSI 6 n`), answered with
+ * `CSI row ; col R`. Used to remember where a placeholder grid's top-left cell landed on screen,
+ * so mouse reports (also absolute-viewport coordinates) can be translated into a position
+ * relative to the grid.
+ */
+export async function queryCursorPosition(timeoutMs = 400): Promise<CursorPosition | null> {
+  const result = await queryTerminal<CursorPosition | null>({
+    query: '\x1b[6n',
+    timeoutMs,
+    tryMatch: (buffer) => {
+      // eslint-disable-next-line no-control-regex -- matching the ESC in a real terminal reply
+      const match = /\x1b\[(\d+);(\d+)R/.exec(buffer);
+      if (!match) return undefined;
+      const rowStr = match[1];
+      const colStr = match[2];
+      if (!rowStr || !colStr) return null;
+      return { row: Number(rowStr), col: Number(colStr) };
+    },
+  });
+  return result ?? null;
+}
+
 /** Best-effort guess from environment variables, used when a live query isn't possible. */
 export function heuristicKittyGraphicsSupport(): KittySupport {
   const env = process.env;

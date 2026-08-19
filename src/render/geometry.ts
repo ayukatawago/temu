@@ -52,3 +52,39 @@ export function fitDeviceToCells(
 
   return { cols, rows, capturePx: { width: captureWidth, height: captureHeight } };
 }
+
+export interface GridOrigin {
+  /** 1-based, absolute terminal coordinates of the grid's top-left cell. */
+  row: number;
+  col: number;
+}
+
+/**
+ * Maps an absolute terminal mouse position back to device pixel coordinates, given where the
+ * placeholder grid's top-left cell landed on screen (queried once via `queryCursorPosition`
+ * right before drawing it) and its size in cells. Targets the device's *full* resolution, not
+ * the (possibly smaller, multiple-of-16-rounded) capture resolution, since `input` coordinates
+ * are in the display's actual current coordinate space.
+ *
+ * This is a coarse, linear approximation: a cell is tens of device pixels across, and the
+ * terminal itself may letterbox the image slightly within the grid rectangle if the cell-aspect
+ * grid doesn't exactly match the device aspect ratio. Good enough for clicking on-screen
+ * controls; hint mode (a later milestone) sidesteps this entirely by tapping accessibility-tree
+ * bounds directly in device pixels instead of going through the cell grid.
+ */
+export function cellToDevicePixel(
+  mouseCol: number,
+  mouseRow: number,
+  origin: GridOrigin,
+  fit: Pick<FitResult, 'cols' | 'rows'>,
+  deviceWidthPx: number,
+  deviceHeightPx: number,
+): { x: number; y: number } {
+  const rawCol = mouseCol - origin.col;
+  const rawRow = mouseRow - origin.row;
+  const clampedCol = Math.min(Math.max(rawCol, 0), fit.cols - 1);
+  const clampedRow = Math.min(Math.max(rawRow, 0), fit.rows - 1);
+  const x = ((clampedCol + 0.5) / fit.cols) * deviceWidthPx;
+  const y = ((clampedRow + 0.5) / fit.rows) * deviceHeightPx;
+  return { x, y };
+}
