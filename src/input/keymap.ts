@@ -1,14 +1,17 @@
 // Decodes raw stdin bytes left over after MouseTracker has taken its share (SGR mouse reports)
-// into a small modal keyboard: normal mode (crosshair nudge + hardware buttons) and text-input
-// mode. Hint mode (`f`) and zoom (`z`) — the real answer to "cells are too coarse to click
-// precisely" — land in a later milestone; this is the fallback that always works.
+// into a small modal keyboard: normal mode (crosshair nudge + hardware buttons), text-input
+// mode, and hint mode (`f`) — the real answer to "cells are too coarse to click precisely",
+// letting the caller (stream.ts) drive tapping via accessibility-tree labels instead of the
+// coarse cell grid. Hint mode itself doesn't know about labels or the accessibility tree at
+// all: it just accumulates printable characters and hands each one to onHintChar, leaving
+// matching/resolution to the caller, which is the only side that has the label list.
 //
 // Terminal input is a byte stream with an inherent ambiguity: a lone ESC byte (the Escape key)
 // looks identical to the start of a CSI sequence (arrow keys, etc.) until the next byte arrives.
 // This buffers incomplete sequences and resolves a trailing lone ESC via a short timeout instead
 // of guessing.
 
-export type KeyboardMode = 'normal' | 'text';
+export type KeyboardMode = 'normal' | 'text' | 'hint';
 
 export interface KeyboardHandlers {
   onQuit: () => void;
@@ -28,6 +31,10 @@ export interface KeyboardHandlers {
   onTextChar: (char: string) => void;
   onTextBackspace: () => void;
   onTextEnter: () => void;
+  onEnterHintMode: () => void;
+  onHintChar: (char: string) => void;
+  onHintCancel: () => void;
+  onZoomToggle: () => void;
 }
 
 const ESCAPE_AMBIGUITY_TIMEOUT_MS = 30;
@@ -139,6 +146,16 @@ export class KeyboardHandler {
     if (this.mode === 'text') {
       this.flushText();
       this.setMode('normal');
+    } else if (this.mode === 'hint') {
+      this.handlers.onHintCancel();
+      this.setMode('normal');
+    }
+  }
+
+  /** Called by the caller once a hint selection resolves (tapped, cancelled, or no matches). */
+  exitHintMode(): void {
+    if (this.mode === 'hint') {
+      this.setMode('normal');
     }
   }
 
@@ -174,7 +191,22 @@ export class KeyboardHandler {
       this.handleTextModeByte(byte);
       return;
     }
+    if (this.mode === 'hint') {
+      this.handleHintModeByte(byte);
+      return;
+    }
     this.handleNormalModeByte(byte);
+  }
+
+  private handleHintModeByte(byte: number): void {
+    if (byte === 0x03) {
+      this.handlers.onQuit();
+      return;
+    }
+    if (byte >= 0x20 && byte < 0x7f) {
+      this.handlers.onHintChar(String.fromCharCode(byte));
+    }
+    // Escape is handled via handleEscapeKey (the lone-ESC/CSI disambiguation path above), not here.
   }
 
   private handleTextModeByte(byte: number): void {
@@ -224,6 +256,13 @@ export class KeyboardHandler {
         return;
       case 0x69: // i
         this.setMode('text');
+        return;
+      case 0x66: // f
+        this.setMode('hint');
+        this.handlers.onEnterHintMode();
+        return;
+      case 0x7a: // z
+        this.handlers.onZoomToggle();
         return;
       case 0x62: // b
         this.handlers.onBack();

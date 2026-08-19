@@ -6,9 +6,16 @@ import { EventEmitter } from 'node:events';
 import type { Readable } from 'node:stream';
 
 export interface TranscodeOptions {
-  /** Output frame size; should match the size screenrecord was told to capture at. */
+  /** Output frame size, after any crop — this is what actually reaches the renderer. */
   width: number;
   height: number;
+  /**
+   * Optional sub-rectangle of the *captured* frame to crop to before scaling, in the capture's
+   * own pixel coordinates. Used by zoom mode: cropping has to happen on a frame captured at full
+   * native resolution to show genuinely more detail — cropping an already-downscaled capture and
+   * scaling the crop back up would just look blurrier, not more detailed.
+   */
+  crop?: { x: number; y: number; width: number; height: number };
 }
 
 // A PNG's IEND chunk always has zero-length data, so its bytes are fixed: a 4-byte length of 0,
@@ -30,6 +37,13 @@ export class PngFrameSplitter extends EventEmitter {
 
   constructor(input: Readable, options: TranscodeOptions) {
     super();
+    const filters = options.crop
+      ? [
+          `crop=${String(options.crop.width)}:${String(options.crop.height)}:${String(options.crop.x)}:${String(options.crop.y)}`,
+          `scale=${String(options.width)}:${String(options.height)}`,
+        ]
+      : [`scale=${String(options.width)}:${String(options.height)}`];
+
     this.ffmpeg = spawn(
       'ffmpeg',
       [
@@ -45,7 +59,7 @@ export class PngFrameSplitter extends EventEmitter {
         '-i',
         'pipe:0',
         '-vf',
-        `scale=${options.width}:${options.height}`,
+        filters.join(','),
         '-f',
         'image2pipe',
         '-vcodec',

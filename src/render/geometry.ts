@@ -88,3 +88,62 @@ export function cellToDevicePixel(
   const y = ((clampedRow + 0.5) / fit.rows) * deviceHeightPx;
   return { x, y };
 }
+
+/** The inverse of {@link cellToDevicePixel}: which cell a device pixel position falls under. */
+export function devicePixelToCell(
+  x: number,
+  y: number,
+  origin: GridOrigin,
+  fit: Pick<FitResult, 'cols' | 'rows'>,
+  deviceWidthPx: number,
+  deviceHeightPx: number,
+): { col: number; row: number } {
+  const col = Math.min(fit.cols - 1, Math.max(0, Math.floor((x / deviceWidthPx) * fit.cols)));
+  const row = Math.min(fit.rows - 1, Math.max(0, Math.floor((y / deviceHeightPx) * fit.rows)));
+  return { col: origin.col + col, row: origin.row + row };
+}
+
+/** A sub-rectangle of the device's full resolution, in device pixels. */
+export interface ZoomRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Computes a fixed-size (`1/factor` of the device's width and height) zoom rectangle centered on
+ * a point, clamped so it stays fully on-screen. The rectangle doesn't recenter as the crosshair
+ * moves once zoomed — press `z` again to pick a new center — which keeps the interaction (and
+ * the ffmpeg crop filter behind it) simple: one fixed region per zoom activation.
+ */
+export function computeZoomRegion(
+  centerX: number,
+  centerY: number,
+  deviceWidthPx: number,
+  deviceHeightPx: number,
+  factor: number,
+): ZoomRegion {
+  const width = Math.max(1, Math.round(deviceWidthPx / factor));
+  const height = Math.max(1, Math.round(deviceHeightPx / factor));
+  const x = Math.min(Math.max(0, Math.round(centerX - width / 2)), deviceWidthPx - width);
+  const y = Math.min(Math.max(0, Math.round(centerY - height / 2)), deviceHeightPx - height);
+  return { x, y, width, height };
+}
+
+/** Like {@link cellToDevicePixel}, but through an active zoom region back to full-device pixels. */
+export function zoomedCellToDevicePixel(
+  mouseCol: number,
+  mouseRow: number,
+  origin: GridOrigin,
+  fit: Pick<FitResult, 'cols' | 'rows'>,
+  region: ZoomRegion,
+): { x: number; y: number } {
+  const rawCol = mouseCol - origin.col;
+  const rawRow = mouseRow - origin.row;
+  const clampedCol = Math.min(Math.max(rawCol, 0), fit.cols - 1);
+  const clampedRow = Math.min(Math.max(rawRow, 0), fit.rows - 1);
+  const x = region.x + ((clampedCol + 0.5) / fit.cols) * region.width;
+  const y = region.y + ((clampedRow + 0.5) / fit.rows) * region.height;
+  return { x, y };
+}

@@ -1,8 +1,8 @@
 // `temu` / `temu --device <serial>`: the live streaming render loop. Attaches to a device,
 // works out how big a grid fits the current pane, and pumps frames from screenrecord through
 // ffmpeg into the Kitty-graphics renderer until the user quits. Also wires up mouse-driven
-// tap/drag/scroll/back (input/mouse.ts + input/adbshell.ts) — the modal keyboard layer for
-// precise targeting (hjkl nudge, hint mode, text entry) lands in later milestones.
+// tap/drag/scroll/back (input/mouse.ts + input/adbshell.ts) and the modal keyboard (crosshair
+// nudge, hardware buttons, text entry, hint mode, zoom).
 
 import { writeFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
@@ -11,15 +11,23 @@ import { getDeviceGeometry, pickDefaultDevice, type DeviceGeometry } from './dev
 import { PngFrameSplitter } from './device/transcode.js';
 import { AdbShellInputBackend } from './input/adbshell.js';
 import type { InputBackend } from './input/backend.js';
+import {
+  dumpUiHierarchy,
+  parseHintTargets,
+  renderHintOverlay,
+  type HintTarget,
+} from './input/hints.js';
 import { KeyboardHandler, type KeyboardMode } from './input/keymap.js';
 import { MouseTracker } from './input/mouse.js';
 import { detectCaps, queryCursorPosition, type CellPixelSize } from './render/caps.js';
 import { renderHelpOverlay, StatusBar } from './render/chrome.js';
 import {
   cellToDevicePixel,
+  computeZoomRegion,
   fitDeviceToCells,
   type FitResult,
   type GridOrigin,
+  type ZoomRegion,
 } from './render/geometry.js';
 import { KittyRenderer } from './render/kitty.js';
 
@@ -45,10 +53,25 @@ export function parseStreamArgs(argv: string[]): StreamOptions {
 const STATUS_BAR_ROWS = 1;
 const RESIZE_DEBOUNCE_MS = 150;
 
+export interface PipelineOptions {
+  /** What screenrecord is told to encode at (`--size`). */
+  capturePx: { width: number; height: number };
+  /** What ffmpeg scales (post-crop, if any) down to — always the on-screen target size. */
+  outputPx: { width: number; height: number };
+  /**
+   * Sub-rectangle of the *captured* frame to crop to before scaling, in capture-pixel
+   * coordinates. Used by zoom mode, which restarts the whole pipeline at full native capture
+   * resolution specifically so a crop shows genuine extra detail rather than a blown-up blur of
+   * an already-downscaled capture.
+   */
+  crop?: { x: number; y: number; width: number; height: number };
+}
+
 /**
  * Owns one running (capture -> transcode) pipeline at a fixed capture resolution, and knows how
  * to tear itself down and be replaced by a new one — the only way to change the resolution
- * screenrecord/ffmpeg are working at, since neither can be resized in place.
+ * screenrecord/ffmpeg are working at, since neither can be resized in place. Resize *and* zoom
+ * both work by tearing down and rebuilding one of these with different options.
  */
 class Pipeline {
   private readonly capture: ScreenrecordSource;
@@ -57,15 +80,15 @@ class Pipeline {
 
   constructor(
     private readonly serial: string,
-    private readonly capturePx: { width: number; height: number },
+    private readonly options: PipelineOptions,
     private readonly bitrate: string,
     private readonly onFrame: (png: Buffer) => void,
     private readonly onLog: (message: string) => void,
   ) {
     this.capture = new ScreenrecordSource({
       serial,
-      width: capturePx.width,
-      height: capturePx.height,
+      width: options.capturePx.width,
+      height: options.capturePx.height,
       bitrate,
     });
     this.capture.on('restart', (event: { code: number | null; count: number }) => {
@@ -77,7 +100,11 @@ class Pipeline {
   }
 
   private attachSplitter(): PngFrameSplitter {
-    const splitter = new PngFrameSplitter(this.capture.h264, this.capturePx);
+    const splitter = new PngFrameSplitter(this.capture.h264, {
+      width: this.options.outputPx.width,
+      height: this.options.outputPx.height,
+      ...(this.options.crop ? { crop: this.options.crop } : {}),
+    });
     splitter.on('frame', this.onFrame);
     splitter.on('exit', (event: { code: number | null }) => {
       if (this.stopped) {
@@ -182,11 +209,22 @@ const CROSSHAIR_BIG_STEP_MULTIPLIER = 5;
 const DEFAULT_FPS_CAP = 15;
 const MIN_FPS_CAP = 1;
 const MAX_FPS_CAP = 30;
+/** Zoom shows 1/ZOOM_FACTOR of the device's width and height, magnified to fill the same grid. */
+const ZOOM_FACTOR = 3;
+
+export interface KeyboardSetup {
+  keyboard: KeyboardHandler;
+  getFpsCap: () => number;
+  isHelpVisible: () => boolean;
+  isHintActive: () => boolean;
+}
 
 /**
  * Wires the modal keyboard's commands up to the input backend, a crosshair position tracked in
- * device pixels, the status bar, and the help overlay. Returns the handler plus a couple of
- * accessors stream.ts's frame pipeline needs (current fps cap, whether help is showing).
+ * device pixels, the status bar, the help overlay, and hint mode. Zoom is the one command this
+ * doesn't fully own: rebuilding the capture pipeline at a different resolution is runStream's
+ * job (it owns `Pipeline`), so `onZoomRequested` just reports where the crosshair was when `z`
+ * was pressed and leaves the rest to the caller.
  */
 function setUpKeyboard(
   input: InputBackend,
@@ -197,12 +235,25 @@ function setUpKeyboard(
   renderer: KittyRenderer,
   statusBar: StatusBar,
   onQuit: () => void,
-): { keyboard: KeyboardHandler; getFpsCap: () => number; isHelpVisible: () => boolean } {
+  onZoomRequested: (centerX: number, centerY: number) => void,
+): KeyboardSetup {
   let crosshair = { x: Math.round(geometry.width / 2), y: Math.round(geometry.height / 2) };
   let fpsCap = DEFAULT_FPS_CAP;
   let helpVisible = false;
+  let hintTargets: HintTarget[] = [];
+  let hintBuffer = '';
+  let hintActive = false;
   statusBar.setFps(fpsCap);
   statusBar.setCrosshair(crosshair);
+
+  const finishHint = (): void => {
+    hintActive = false;
+    hintBuffer = '';
+    hintTargets = [];
+    const fit = getFit();
+    renderer.resize(fit.cols, fit.rows); // forces a placeholder redraw, clearing the overlay
+    keyboard.exitHintMode();
+  };
 
   const keyboard = new KeyboardHandler({
     onQuit,
@@ -260,9 +311,67 @@ function setUpKeyboard(
     onTextChar: (chars) => input.text(chars),
     onTextBackspace: () => input.keyevent('KEYCODE_DEL'),
     onTextEnter: () => input.keyevent('KEYCODE_ENTER'),
+    onEnterHintMode: () => {
+      hintBuffer = '';
+      hintActive = false;
+      statusBar.showToast('computing hints…', 15000);
+      dumpUiHierarchy(serial)
+        .then((xml) => {
+          const targets = parseHintTargets(xml);
+          if (targets.length === 0) {
+            statusBar.showToast('no clickable elements found', 2000);
+            finishHint();
+            return;
+          }
+          hintTargets = targets;
+          hintActive = true;
+          const fit = getFit();
+          renderHintOverlay(targets, origin, fit, geometry.width, geometry.height);
+          statusBar.showToast(
+            `hint: ${String(targets.length)} targets — type a label, Esc cancels`,
+            15000,
+          );
+        })
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          statusBar.showToast(`hint mode failed: ${message}`, 3000);
+          finishHint();
+        });
+    },
+    onHintChar: (char) => {
+      if (!hintActive) {
+        return; // dump still in flight — ignore keys typed too early
+      }
+      hintBuffer += char.toLowerCase();
+      const matches = hintTargets.filter((target) => target.label.startsWith(hintBuffer));
+      if (matches.length === 0) {
+        statusBar.showToast('no match', 1200);
+        finishHint();
+        return;
+      }
+      const exact = matches.find((target) => target.label === hintBuffer);
+      if (exact && matches.length === 1) {
+        const cx = (exact.bounds.x1 + exact.bounds.x2) / 2;
+        const cy = (exact.bounds.y1 + exact.bounds.y2) / 2;
+        input.tap(cx, cy);
+        finishHint();
+      }
+      // Otherwise the buffer is still a valid prefix of more than one label — wait for more.
+    },
+    onHintCancel: () => {
+      finishHint();
+    },
+    onZoomToggle: () => {
+      onZoomRequested(crosshair.x, crosshair.y);
+    },
   });
 
-  return { keyboard, getFpsCap: () => fpsCap, isHelpVisible: () => helpVisible };
+  return {
+    keyboard,
+    getFpsCap: () => fpsCap,
+    isHelpVisible: () => helpVisible,
+    isHintActive: () => hintActive,
+  };
 }
 
 export async function runStream(argv: string[]): Promise<number> {
@@ -321,12 +430,12 @@ export async function runStream(argv: string[]): Promise<number> {
   });
   const statusBar = new StatusBar(gridOrigin.row + fit.rows, fit.cols);
 
-  // Frame-rate cap and the help overlay both gate frames before they ever reach dropFrame:
+  // Frame-rate cap and the help/hint overlays all gate frames before they ever reach dropFrame:
   // capturing/transcoding keep running regardless (there's no cheap way to pause screenrecord),
   // this just decides whether a given decoded frame is worth spending a render on.
   let lastRenderedAt = 0;
   const onCaptureFrame = (png: Buffer): void => {
-    if (isHelpVisible()) {
+    if (isHelpVisible() || isHintActive()) {
       return;
     }
     const now = Date.now();
@@ -337,9 +446,27 @@ export async function runStream(argv: string[]): Promise<number> {
     dropFrame(png);
   };
 
-  let pipeline = new Pipeline(serial, fit.capturePx, options.bitrate, onCaptureFrame, (message) => {
-    console.error(message);
-  });
+  // Zoom restarts the whole pipeline at full native capture resolution with a crop, rather than
+  // cropping the already-downscaled normal capture — see PipelineOptions' doc comment for why.
+  let zoomRegion: ZoomRegion | null = null;
+  const buildPipelineOptions = (): PipelineOptions =>
+    zoomRegion
+      ? {
+          capturePx: { width: geometry.width, height: geometry.height },
+          outputPx: fit.capturePx,
+          crop: zoomRegion,
+        }
+      : { capturePx: fit.capturePx, outputPx: fit.capturePx };
+
+  let pipeline = new Pipeline(
+    serial,
+    buildPipelineOptions(),
+    options.bitrate,
+    onCaptureFrame,
+    (message) => {
+      console.error(message);
+    },
+  );
 
   let resizeTimer: NodeJS.Timeout | null = null;
   const handleResize = (): void => {
@@ -361,9 +488,15 @@ export async function runStream(argv: string[]): Promise<number> {
       renderer.resize(fit.cols, fit.rows);
       statusBar.resize(gridOrigin.row + fit.rows, fit.cols);
       pipeline.stop();
-      pipeline = new Pipeline(serial, fit.capturePx, options.bitrate, onCaptureFrame, (message) => {
-        console.error(message);
-      });
+      pipeline = new Pipeline(
+        serial,
+        buildPipelineOptions(),
+        options.bitrate,
+        onCaptureFrame,
+        (message) => {
+          console.error(message);
+        },
+      );
     }, RESIZE_DEBOUNCE_MS);
   };
   process.stdout.on('resize', handleResize);
@@ -400,8 +533,25 @@ export async function runStream(argv: string[]): Promise<number> {
   process.once('SIGINT', quit);
   process.once('SIGTERM', quit);
 
+  const onZoomRequested = (centerX: number, centerY: number): void => {
+    zoomRegion = zoomRegion
+      ? null
+      : computeZoomRegion(centerX, centerY, geometry.width, geometry.height, ZOOM_FACTOR);
+    statusBar.showToast(zoomRegion ? `zoomed ${String(ZOOM_FACTOR)}x` : 'zoom off', 1500);
+    pipeline.stop();
+    pipeline = new Pipeline(
+      serial,
+      buildPipelineOptions(),
+      options.bitrate,
+      onCaptureFrame,
+      (message) => {
+        console.error(message);
+      },
+    );
+  };
+
   const mouseTracker = setUpMouse(input, gridOrigin, () => fit, geometry);
-  const { keyboard, getFpsCap, isHelpVisible } = setUpKeyboard(
+  const { keyboard, getFpsCap, isHelpVisible, isHintActive } = setUpKeyboard(
     input,
     serial,
     geometry,
@@ -410,6 +560,7 @@ export async function runStream(argv: string[]): Promise<number> {
     renderer,
     statusBar,
     quit,
+    onZoomRequested,
   );
   const onStdinData = (chunk: Buffer): void => {
     const leftover = mouseTracker.feed(chunk);
