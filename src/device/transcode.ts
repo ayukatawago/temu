@@ -16,16 +16,6 @@ export interface TranscodeOptions {
    * scaling the crop back up would just look blurrier, not more detailed.
    */
   crop?: { x: number; y: number; width: number; height: number };
-  /**
-   * Caps ffmpeg's own output rate via its `fps` filter, applied before crop/scale. Without this,
-   * ffmpeg fully decodes and PNG-encodes every frame screenrecord delivers (content-driven, up to
-   * its native ~25fps during real motion — see device/capture.ts), even though a fps-capping
-   * consumer downstream only ever uses a fraction of them. That's wasted work competing with
-   * input handling on the same single-threaded event loop; capping it here instead of discarding
-   * after the fact measurably reduces total CPU and data volume (verified: an ~21fps motion clip
-   * dropped to ~7fps of *actual PNG-encoded output* with `fps=8`, not just fewer frames used).
-   */
-  fps?: number;
 }
 
 // A PNG's IEND chunk always has zero-length data, so its bytes are fixed: a 4-byte length of 0,
@@ -47,10 +37,30 @@ export class PngFrameSplitter extends EventEmitter {
 
   constructor(input: Readable, options: TranscodeOptions) {
     super();
+    // No `fps=N` filter here (there used to be one, to cap ffmpeg's own encode rate below
+    // screenrecord's native ~25fps). It computes each frame's duration from the *next* frame's
+    // PTS, so on top of the underlying Annex-B issue below, it added its own reason to withhold
+    // the newest decoded frame until a successor showed up. Removing it doesn't fully fix "a
+    // screen that changes once and then holds still" (see the note below on why that needs the
+    // screencap watchdog in stream.ts instead) — but it does fix the pipeline stalling *during
+    // genuine ongoing motion*, which it was doing unconditionally: verified with 20 realistically
+    // -paced access units fed over a live pipe, this filter alone made ffmpeg emit zero frames,
+    // full stop, regardless of the fps_probe_size fix below. stream.ts already throttles what it
+    // renders down to the newest frame per tick, so nothing downstream needed the fps cap to
+    // begin with.
+    //
+    // Deeper cause of the "changes once, then holds still" case, for whoever hits this next: raw
+    // H.264 Annex-B has no explicit end-of-access-unit marker, so ffmpeg's demuxer/parser can
+    // only tell the current AU is complete once it sees the start code of the *next* NAL (or
+    // reaches EOF). On a live, unterminated pipe, a truly final frame — nothing sent after it,
+    // ever — has no next NAL to trigger that, so it sits parsed-but-unemitted forever. Verified
+    // precisely (encoding 6 distinguishable frames, comparing decoded PNG bytes against a
+    // known-good EOF-terminated decode of the same data): with both this fps-filter removal and
+    // `-fpsprobesize 0` below, the true final frame of a feed-then-go-silent sequence was *never*
+    // emitted, even after a 3s wait — the decoder stayed exactly one frame behind. That's why the
+    // screencap-based staleness watchdog in stream.ts still exists and is not just a backstop for
+    // rare cases; it's the only thing that can ever surface that last frame at all.
     const filters: string[] = [];
-    if (options.fps) {
-      filters.push(`fps=${String(options.fps)}`);
-    }
     if (options.crop) {
       filters.push(
         `crop=${String(options.crop.width)}:${String(options.crop.height)}:${String(options.crop.x)}:${String(options.crop.y)}`,
@@ -80,6 +90,16 @@ export class PngFrameSplitter extends EventEmitter {
         // motion bursts over an 18s session, each producing frames within ~1-2s.
         '-max_ts_probe',
         '1',
+        // `fps_probe_size` (default 20 *frames*) is a second, independent probe counter that
+        // `-max_ts_probe` does not cover — avformat_find_stream_info() still waits to see this
+        // many frames before returning, even with the timestamp probe capped at 1. On this
+        // project's content-driven capture that can be many seconds of real interaction before
+        // the first output frame, which is the same "view is dead" symptom -max_ts_probe was
+        // added for above, just gated on a different counter. Verified: setting this to 0 was
+        // necessary (though not sufficient on its own — see the fps-filter removal above) to get
+        // any frame at all out of a live emulator that had gone idle.
+        '-fpsprobesize',
+        '0',
         '-f',
         'h264',
         '-i',

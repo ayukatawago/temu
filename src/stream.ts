@@ -7,7 +7,12 @@
 import { writeFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
 import { captureScreencapPng, ScreenrecordSource } from './device/capture.js';
-import { getDeviceGeometry, pickDefaultDevice, type DeviceGeometry } from './device/discover.js';
+import {
+  getDeviceGeometry,
+  isDisplayOn,
+  pickDefaultDevice,
+  type DeviceGeometry,
+} from './device/discover.js';
 import { PngFrameSplitter, scalePng } from './device/transcode.js';
 import { AdbShellInputBackend } from './input/adbshell.js';
 import type { InputBackend } from './input/backend.js';
@@ -66,8 +71,6 @@ export interface PipelineOptions {
    * an already-downscaled capture.
    */
   crop?: { x: number; y: number; width: number; height: number };
-  /** Caps ffmpeg's own encode rate — see TranscodeOptions.fps for why this matters. */
-  fps: number;
 }
 
 /**
@@ -106,7 +109,6 @@ class Pipeline {
     const splitter = new PngFrameSplitter(this.capture.h264, {
       width: this.options.outputPx.width,
       height: this.options.outputPx.height,
-      fps: this.options.fps,
       ...(this.options.crop ? { crop: this.options.crop } : {}),
     });
     splitter.on('frame', this.onFrame);
@@ -227,19 +229,29 @@ function setUpMouse(
 }
 
 const CROSSHAIR_BIG_STEP_MULTIPLIER = 5;
-// Deliberately conservative: each displayed frame costs a disk write (Kitty's t=t transmission)
-// and a terminal-side PNG decode, on top of ffmpeg's own decode+encode — this pipeline isn't
-// aiming for video frame rates, and pushing it higher visibly costs input responsiveness (see
-// MAX_FPS_CAP's use as ffmpeg's own encode-rate ceiling below, in buildPipelineOptions).
-const DEFAULT_FPS_CAP = 8;
+// These used to be tuned lower (8/15) partly to fit under ffmpeg's own `fps=N` output filter,
+// which capped the live pipeline's encode rate below MAX_FPS_CAP (see transcode.ts). That filter
+// is gone now — ffmpeg decodes/encodes at screenrecord's own content-driven rate (up to its
+// native ~25fps) regardless of the display cap — so this is purely about how often stream.ts
+// spends effort rendering an already-decoded frame (a disk write plus a terminal-side PNG
+// decode). PNG encode itself measures ~5.5ms CPU/frame at this pane size on typical hardware, so
+// these are headroom ceilings, not tuned-for-smoothness targets; +/- still adjust the display
+// rate live without needing either value to be exactly right.
+const DEFAULT_FPS_CAP = 20;
 const MIN_FPS_CAP = 1;
-const MAX_FPS_CAP = 15;
+const MAX_FPS_CAP = 30;
 /** Zoom shows 1/ZOOM_FACTOR of the device's width and height, magnified to fill the same grid. */
 const ZOOM_FACTOR = 3;
 /**
  * How long the live H.264 pipeline can go without producing a new frame before it's treated as
- * stuck and a corrective `screencap` is taken instead — see the staleness-watchdog note in
- * runStream for why this is needed even after the fps-cap/screencap-seeding fixes.
+ * stuck and a corrective `screencap` is taken instead. This is still the *primary* mechanism for
+ * "the screen changed once and then held still" (e.g. a popup) — not a rare backstop. Raw H.264
+ * Annex-B has no end-of-access-unit marker, so ffmpeg's parser only knows a frame is complete
+ * once it sees the start of the *next* one (or EOF); a genuinely final frame on a live, open
+ * pipe has neither, and stays parsed-but-unemitted forever no matter how the demuxer/filters are
+ * tuned (verified: even with transcode.ts's fps-filter removal and `-fpsprobesize 0`, the true
+ * final frame of a feed-then-go-silent sequence was never emitted). This watchdog is the only
+ * thing that can surface that frame at all.
  */
 const STALE_FRAME_THRESHOLD_MS = 1500;
 
@@ -429,7 +441,9 @@ export async function runStream(argv: string[]): Promise<number> {
     return 1;
   }
 
-  const caps = await detectCaps();
+  // Run alongside detectCaps rather than after it — it's a diagnostic check (see isDisplayOn's
+  // doc comment), so it shouldn't add its own wall-clock delay to startup.
+  const [caps, displayOn] = await Promise.all([detectCaps(), isDisplayOn(serial)]);
   // 'unknown' (heuristic couldn't tell) is treated optimistically — try Kitty graphics anyway.
   // Only a confirmed 'false' falls back, since the fallback is a real quality trade-off.
   const useBlocks = caps.kittyGraphicsSupported === false;
@@ -479,18 +493,25 @@ export async function runStream(argv: string[]): Promise<number> {
   });
   const statusBar = new StatusBar(gridOrigin.row + fit.rows, fit.cols);
 
-  // Seed the pane with a real snapshot immediately. Verified empirically (feeding ffmpeg's
-  // decoder controlled bursts of NAL units through a pipe, with and without a live tap):
-  // screenrecord's H.264 stream can sit fully decoded-but-unflushed inside ffmpeg for many
-  // seconds on a genuinely idle screen — no amount of -fflags/-avioflags/-fpsprobesize tuning
-  // gets it to emit before it either receives a steady trickle of new packets or the process
-  // ends. Motion (e.g. a tap) supplies that trickle, which is why the pane used to stay blank
-  // until the user interacted with it. A one-shot screencap bypasses the whole H.264 pipeline
-  // and shows the actual current screen right away; the live stream overwrites it as soon as
-  // it manages to produce its own first frame. Scaled to the exact size the live pipeline
-  // renders at — screencap's native resolution has a different aspect-ratio rounding than
-  // fitDeviceToCells' pane-pixel-perfect fit, and displaying it as-is showed up as a visible
-  // squish/resize the moment the live stream's first (correctly-sized) frame replaced it.
+  // screenrecord emits essentially nothing while the display is asleep (see isDisplayOn's doc
+  // comment) — from here that's indistinguishable from a broken pipeline, so say so explicitly
+  // rather than leaving the pane looking stuck. Deliberately doesn't send KEYCODE_WAKEUP itself:
+  // temu shouldn't change device state on the user's behalf just for starting up.
+  if (!displayOn) {
+    statusBar.showToast('device display is asleep — press p to wake', 8000);
+  }
+
+  // Seed the pane with a real snapshot immediately. Same root cause as the staleness watchdog
+  // below: the first frame screenrecord captures on launch has nothing after it yet, so ffmpeg's
+  // Annex-B parser can't tell it's complete and won't emit it until a *second* frame's data
+  // starts arriving — which, if the screen is genuinely static from the moment temu starts,
+  // might not happen for an unbounded time. A one-shot screencap bypasses the whole H.264
+  // pipeline and shows the actual current screen right away; the live stream overwrites it as
+  // soon as it manages to produce its own first frame. Scaled to the exact size the live
+  // pipeline renders at — screencap's native resolution has a different aspect-ratio rounding
+  // than fitDeviceToCells' pane-pixel-perfect fit, and displaying it as-is showed up as a
+  // visible squish/resize the moment the live stream's first (correctly-sized) frame replaced
+  // it.
   captureScreencapPng(serial)
     .then((png) => scalePng(png, fit.capturePx.width, fit.capturePx.height))
     .then((png) => dropFrame(png))
@@ -575,18 +596,17 @@ export async function runStream(argv: string[]): Promise<number> {
   // Zoom restarts the whole pipeline at full native capture resolution with a crop, rather than
   // cropping the already-downscaled normal capture — see PipelineOptions' doc comment for why.
   let zoomRegion: ZoomRegion | null = null;
-  // ffmpeg is always capped at MAX_FPS_CAP regardless of the *current* display fps (adjustable
-  // live via +/- without a restart) — this only bounds the worst case of wasted encode work,
-  // never the user's chosen display rate, and MAX_FPS_CAP is the highest that rate can ever be.
+  // ffmpeg decodes and PNG-encodes every frame screenrecord delivers regardless of the current
+  // display fps (adjustable live via +/- without a restart); the render tick (below) is what
+  // throttles what's actually rendered down to the newest frame per tick.
   const buildPipelineOptions = (): PipelineOptions =>
     zoomRegion
       ? {
           capturePx: { width: geometry.width, height: geometry.height },
           outputPx: fit.capturePx,
           crop: zoomRegion,
-          fps: MAX_FPS_CAP,
         }
-      : { capturePx: fit.capturePx, outputPx: fit.capturePx, fps: MAX_FPS_CAP };
+      : { capturePx: fit.capturePx, outputPx: fit.capturePx };
 
   let pipeline = new Pipeline(
     serial,

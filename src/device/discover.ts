@@ -77,3 +77,24 @@ export async function getDeviceGeometry(serial: string): Promise<DeviceGeometry>
   }
   return { width: Number(widthStr), height: Number(heightStr) };
 }
+
+/**
+ * Whether the device's display is currently on. `screenrecord` emits essentially nothing while
+ * the display is asleep (measured: 64 bytes over 8 seconds, vs ~26KB/10s idle-but-awake) — from
+ * temu's side that looks identical to a broken pipeline, so callers use this to tell the user
+ * what's actually going on instead of leaving a blank pane unexplained.
+ *
+ * Uses `dumpsys deviceidle get screen` rather than `dumpsys power`'s `mWakefulness` line: the
+ * former returns a single bare `true`/`false` (measured ~45ms round trip), while the latter
+ * dumps its entire ~115KB service state just to grep one line out of it. Defaults to `true`
+ * (display assumed on) on any parse failure or adb error — this is a diagnostic hint, not a
+ * gate, and must never itself block or fail streaming.
+ */
+export async function isDisplayOn(serial: string): Promise<boolean> {
+  try {
+    const output = await runAdb(['-s', serial, 'shell', 'dumpsys', 'deviceidle', 'get', 'screen']);
+    return output.trim() !== 'false';
+  } catch {
+    return true;
+  }
+}
