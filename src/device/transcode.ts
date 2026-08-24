@@ -180,6 +180,16 @@ export class PngFrameSplitter extends EventEmitter {
         'image2pipe',
         '-vcodec',
         'png',
+        // ffmpeg's PNG encoder defaults to zlib level 6, which measured ~0.6-0.8s to encode a
+        // single full-resolution iOS frame (1206x2622) on this dev machine — far slower than any
+        // fps cap this codebase offers, so every iOS frame queued up behind the encoder, not the
+        // capture source or the render tick. Level 1 measured ~0.1-0.15s for the same frame (a
+        // ~5x speedup) at only ~20% larger output. That size cost is irrelevant here: the PNG
+        // goes straight from a local temp file back into Kitty's `t=t` transmission, never over
+        // a network. Applies to both platforms since Android's frames are already small enough
+        // that the encoder was never the bottleneck there — this can only help.
+        '-compression_level',
+        '1',
         'pipe:1',
       ],
       { stdio: ['pipe', 'pipe', 'pipe'] },
