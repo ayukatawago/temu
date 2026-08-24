@@ -78,8 +78,11 @@ function parseBounds(boundsStr: string): DeviceBounds | null {
  * be an unresolvable prefix of a two-letter one like "ab", since hint selection resolves as soon
  * as the typed buffer exactly matches a label. Keeping every label in one run the same length
  * makes that ambiguity structurally impossible.
+ *
+ * Exported so src/device/ios/hints.ts (sim-use's accessibility tree, rather than uiautomator's)
+ * can assign labels the exact same way instead of re-implementing this.
  */
-function generateLabels(count: number): string[] {
+export function generateLabels(count: number): string[] {
   const alphabet = 'abcdefghijklmnopqrstuvwxyz';
   if (count <= alphabet.length) {
     return alphabet.slice(0, count).split('');

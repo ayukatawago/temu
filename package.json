@@ -1,7 +1,7 @@
 {
   "name": "temu",
   "version": "0.1.0",
-  "description": "Display and drive an Android emulator (and later, iOS Simulator) as live pixels inside a tmux pane",
+  "description": "Display and drive an Android emulator or iOS Simulator as live pixels inside a tmux pane",
   "type": "module",
   "bin": {
     "temu": "./dist/cli.js"

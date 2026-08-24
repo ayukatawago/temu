@@ -5,16 +5,22 @@ import { runStream } from './stream.js';
 import { runTmuxLayout } from './tmuxlayout.js';
 
 function printUsage(): void {
-  console.log('temu — display and drive an Android emulator inside a tmux pane');
+  console.log('temu — display and drive an Android emulator or iOS Simulator inside a tmux pane');
   console.log('');
-  console.log('Usage: temu [--device <serial>] [--bitrate <rate>]');
+  console.log('Usage: temu [--device <serial|udid>] [--platform ios|android] [--bitrate <rate>]');
   console.log('       temu doctor [--fix] [--calibrate]');
-  console.log('       temu tmux [--device <serial>] [--percent <n>]');
+  console.log('       temu tmux [--device <serial|udid>] [--platform ios|android] [--percent <n>]');
   console.log('');
   console.log('Commands:');
-  console.log('  (none)  Attach to a device and stream its screen into this pane');
-  console.log('  doctor  Check environment: adb, ffmpeg, tmux, terminal graphics');
+  console.log('  (none)  Attach to a device/simulator and stream its screen into this pane');
+  console.log('  doctor  Check environment: adb, ffmpeg, tmux, terminal graphics, sim-use');
   console.log('  tmux    Split the current tmux window and run temu in the new pane');
+  console.log('');
+  console.log('--device without --platform auto-detects: a UUID-shaped value is treated as an iOS');
+  console.log(
+    'Simulator UDID, anything else as an adb serial. With neither flag, temu attaches to the',
+  );
+  console.log('sole available device/simulator across both platforms.');
 }
 
 async function main(): Promise<void> {
@@ -33,17 +39,21 @@ async function main(): Promise<void> {
       process.exitCode = await runStream([]);
       break;
     }
-    case '--device':
-    case '--bitrate': {
-      process.exitCode = await runStream(process.argv.slice(2));
-      break;
-    }
     case '--help':
     case '-h': {
       printUsage();
       break;
     }
     default: {
+      // Any other leading token is assumed to be a flag for the default streaming command
+      // (`--device`, `--platform`, `--bitrate`, ...) rather than an unrecognized subcommand —
+      // runStream's own arg parser (src/stream.ts's parseStreamArgs) is the single source of
+      // truth for which flags are actually valid; unknown ones are silently ignored there, same
+      // as before this dispatch was widened past a fixed `--device`/`--bitrate` allowlist.
+      if (command.startsWith('--')) {
+        process.exitCode = await runStream(process.argv.slice(2));
+        break;
+      }
       printUsage();
       process.exitCode = 1;
       break;

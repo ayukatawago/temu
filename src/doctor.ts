@@ -4,6 +4,7 @@
 
 import { execFile } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { isSimUseAvailable, listBootedSimulators } from './device/ios/discover.js';
 import {
   detectCaps,
   getTmuxAllowPassthrough,
@@ -88,6 +89,57 @@ async function checkAdbDevices(): Promise<CheckResult> {
   }
 }
 
+/**
+ * Like checkBinaryVersion, but reports a missing binary as `warn` rather than `fail`. iOS
+ * Simulator support (xcrun/sim-use) is optional — a machine with only Android tooling shouldn't
+ * have `temu doctor` report "problems" over tooling it never needed.
+ */
+async function checkOptionalBinaryVersion(
+  name: string,
+  versionArgs: string[],
+): Promise<CheckResult> {
+  const result = await checkBinaryVersion(name, versionArgs);
+  return result.status === 'fail' ? { ...result, status: 'warn' } : result;
+}
+
+/**
+ * `sim-use` is required for iOS Simulator targets (it's the only way to reach the private
+ * SimulatorKit APIs both the bgra framebuffer capture and all input go through — see
+ * src/device/ios/simuse.ts) — but is entirely unused for Android, so its absence is a `warn`,
+ * not a `fail`.
+ */
+async function checkSimUse(): Promise<CheckResult> {
+  const installed = await isSimUseAvailable();
+  return {
+    label: 'sim-use',
+    status: installed ? 'ok' : 'warn',
+    detail: installed
+      ? 'present'
+      : 'not found on PATH — required for iOS Simulator targets (Android is unaffected)',
+  };
+}
+
+async function checkBootedSimulators(): Promise<CheckResult> {
+  try {
+    const sims = await listBootedSimulators();
+    if (sims.length === 0) {
+      return { label: 'booted iOS simulators', status: 'info', detail: 'none booted' };
+    }
+    return {
+      label: 'booted iOS simulators',
+      status: 'ok',
+      detail: sims.map((sim) => `${sim.name} (${sim.udid})`).join(', '),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      label: 'booted iOS simulators',
+      status: 'warn',
+      detail: `could not list (${message})`,
+    };
+  }
+}
+
 function askYesNo(question: string, defaultYes: boolean): Promise<boolean> {
   return new Promise((resolveP) => {
     if (!process.stdin.isTTY) {
@@ -161,6 +213,28 @@ export async function runDoctor(argv: string[]): Promise<number> {
   record(await checkAdbDevices());
   record(await checkBinaryVersion('ffmpeg', ['-version']));
   record(await checkBinaryVersion('tmux', ['-V']));
+
+  // iOS Simulator support only exists on macOS, and is optional even there — none of these
+  // affect Android, so nothing here sets hadFailure.
+  if (process.platform === 'darwin') {
+    record(await checkOptionalBinaryVersion('xcrun', ['--version']));
+    const simUse = await checkSimUse();
+    record(simUse);
+    if (simUse.status === 'ok') {
+      record(await checkBootedSimulators());
+    }
+    console.log(
+      '  · temu always runs sim-use with SIM_USE_NO_DAEMON=1 — measured on this dev machine, ' +
+        'the sim-use background daemon adds a flat ~5s to every call, worse than the per-call ' +
+        'cost it exists to amortise (a bare HID call: ~0.15s without it).',
+    );
+  } else {
+    record({
+      label: 'iOS Simulator support',
+      status: 'info',
+      detail: 'skipped — requires macOS',
+    });
+  }
 
   const insideTmux = isInsideTmux();
   record({

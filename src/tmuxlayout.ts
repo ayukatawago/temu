@@ -10,10 +10,12 @@
 // passing on some machines but not others.
 
 import { execFile } from 'node:child_process';
+import type { Platform } from './device/target.js';
 import { isInsideTmux } from './render/caps.js';
 
 export interface TmuxLayoutOptions {
   device?: string | undefined;
+  platform?: Platform | undefined;
   /** Width the new (video) pane takes, as a percentage of the current window. */
   percent: number;
 }
@@ -22,10 +24,16 @@ const DEFAULT_PANE_PERCENT = 40;
 
 export function parseTmuxArgs(argv: string[]): TmuxLayoutOptions {
   let device: string | undefined;
+  let platform: Platform | undefined;
   let percent = DEFAULT_PANE_PERCENT;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--device') {
       device = argv[++i];
+    } else if (argv[i] === '--platform') {
+      const value = argv[++i];
+      if (value === 'ios' || value === 'android') {
+        platform = value;
+      }
     } else if (argv[i] === '--percent') {
       const value = Number(argv[++i]);
       if (Number.isFinite(value) && value > 0 && value < 100) {
@@ -33,7 +41,7 @@ export function parseTmuxArgs(argv: string[]): TmuxLayoutOptions {
       }
     }
   }
-  return { device, percent };
+  return { device, platform, percent };
 }
 
 function runTmux(args: string[]): Promise<{ ok: boolean; stderr: string }> {
@@ -66,6 +74,9 @@ export async function runTmuxLayout(argv: string[]): Promise<number> {
   ];
   if (options.device) {
     args.push('--device', options.device);
+  }
+  if (options.platform) {
+    args.push('--platform', options.platform);
   }
 
   const result = await runTmux(args);

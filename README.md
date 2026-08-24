@@ -1,11 +1,15 @@
 # temu
 
-Display and drive an Android emulator (and later, iOS Simulator) as live pixels inside a tmux
+Display and drive an Android emulator or a booted iOS Simulator as live pixels inside a tmux
 pane — so the device sits side by side with a CLI AI agent instead of in a separate GUI window.
 
 ## Requirements
 
-- `adb` on `PATH`, with a running Android emulator or connected device
+- `adb` on `PATH`, with a running Android emulator or connected device — for Android targets
+- macOS with Xcode's Simulator, plus `sim-use` on `PATH` — for iOS Simulator targets. `sim-use`
+  is the only way to reach a simulator's private framebuffer/HID APIs; there's no
+  zero-dependency path (`xcrun simctl` alone can capture a screenshot but has no input verb of
+  any kind). Not needed at all if you only ever attach to Android devices.
 - `ffmpeg` on `PATH`
 - tmux, if run inside it (temu works outside tmux too)
 - Ideally a terminal with Kitty graphics protocol support (virtual placements), for real pixels.
@@ -15,16 +19,21 @@ pane — so the device sits side by side with a CLI AI agent instead of in a sep
 ## Usage
 
 ```sh
-temu                            # attach to the only connected device and stream its screen
-temu --device <serial>          # attach to a specific device (adb serial)
-temu --bitrate <rate>           # screenrecord encode bitrate, e.g. 4M (default 8M)
-temu tmux [--device <serial>] [--percent <n>]
+temu                            # attach to the only connected device/simulator and stream it
+temu --device <serial>          # attach to a specific Android device (adb serial)
+temu --device <udid>            # attach to a specific iOS Simulator (auto-detected by UUID shape)
+temu --platform ios             # disambiguate platform without naming a specific device/udid
+temu --bitrate <rate>           # screenrecord encode bitrate, e.g. 4M (default 8M; Android only)
+temu tmux [--device <id>] [--platform ios|android] [--percent <n>]
                                  # split the current tmux window (new pane gets <n>% of its
                                  # width, default 40) and run temu in the new pane
 temu doctor [--fix] [--no-render-test]
-                                 # check adb/ffmpeg/tmux/terminal-graphics; --fix offers to turn
-                                 # on tmux's allow-passthrough if it's off
+                                 # check adb/ffmpeg/tmux/terminal-graphics/sim-use; --fix offers
+                                 # to turn on tmux's allow-passthrough if it's off
 ```
+
+With no `--device`, temu attaches to the sole device/simulator visible across both platforms —
+an ambiguous or empty result errors out listing what it found (or didn't).
 
 While streaming:
 
@@ -43,6 +52,24 @@ While streaming:
 | `+` / `-`                                    | Raise / lower the render frame-rate cap                                       |
 | `?`                                          | Toggle the key-binding help overlay                                           |
 | `q` / `Ctrl+C`                               | Quit                                                                          |
+
+### iOS Simulator differences
+
+- **Drag** is one coalesced swipe on release, not a live-tracked motion path: sim-use's per-call
+  latency (~0.15-0.25s, even bypassing its own daemon) is too slow to send intermediate touch
+  positions the way Android's persistent `adb shell` session can (~21ms/call). Flick-scrolling
+  still gets plausible velocity from the elapsed time between press and release.
+- **Recents and volume have no primitive at all** in sim-use's API — pressing `r`/`[`/`]` shows a
+  toast instead of doing nothing silently.
+- **Back** is a best-effort left-edge swipe (the same gesture a finger would use to pop a
+  `UINavigationController` screen), since iOS has no system-wide Back button/gesture API the way
+  Android's `KEYCODE_BACK` is — it works on screens that support edge-swipe-back and does nothing
+  on ones that don't.
+- **Hint mode (`f`) takes noticeably longer** (~5s vs ~2s on Android): it walks sim-use's
+  accessibility quadtree rather than dumping Android's uiautomator tree.
+- **Crosshair/zoom/hint coordinates are UIKit points, not pixels** — about a third the magnitude
+  of the device's real framebuffer resolution on Retina simulators; this is handled internally,
+  not something you need to account for.
 
 ## Development
 

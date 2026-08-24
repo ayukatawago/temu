@@ -1,11 +1,17 @@
-// Decodes the raw H.264 stream from ScreenrecordSource into individual PNG frames via ffmpeg,
-// splitting ffmpeg's concatenated `image2pipe` output back into per-frame buffers.
+// Decodes a raw device video stream — Android's H.264 (ScreenrecordSource) or iOS's raw BGRA
+// framebuffer (BgraFramebufferSource) — into individual PNG frames via ffmpeg, splitting
+// ffmpeg's concatenated `image2pipe` output back into per-frame buffers. One splitter class for
+// both: crop/scale and the IEND-splitting output side are identical regardless of source, only
+// ffmpeg's *input* flags differ (see `buildInputArgs` below).
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import type { Readable } from 'node:stream';
+import type { FrameSourceDescriptor } from './target.js';
 
 export interface TranscodeOptions {
+  /** What kind of raw stream ffmpeg is being asked to decode — see {@link FrameSourceDescriptor}. */
+  source: FrameSourceDescriptor;
   /** Output frame size, after any crop — this is what actually reaches the renderer. */
   width: number;
   height: number;
@@ -18,6 +24,95 @@ export interface TranscodeOptions {
   crop?: { x: number; y: number; width: number; height: number };
 }
 
+// sim-use's `--format bgra` stream pads BOTH dimensions of the real framebuffer up to the
+// nearest 16 pixels — a 16x16 tile-alignment convention, not just a row-stride quirk — rather
+// than sending tight `width x height` frames. Verified directly against this project's test
+// simulator (iPhone 17, real size 1206x2622): declaring the untouched real width alone (fixed
+// first) still left a *height* mismatch that ffmpeg has no way to detect on its own, since
+// rawvideo has zero framing — each fixed-size read silently starts a few rows later into the
+// stream than the true next frame does, and since every single real frame is short by the same
+// fixed number of bytes, that few-rows offset *compounds frame after frame*, scrolling the
+// decoded image vertically over time (top/bottom visibly swapping places "during operation") even
+// though every individual frame decodes cleanly on its own. Confirmed by tracking a fixed visual
+// landmark (the Dynamic Island cutout) across a long capture: its position drifted down by
+// *exactly* 2 rows per emitted frame, and 2622 rounded up to the nearest 16 is 2624 — a 2-row
+// shortfall, matching precisely. Declaring the true padded size (1216x2624 — both dimensions
+// independently confirmed by side-by-side decode against captured raw samples) and cropping the
+// padding off produced a pixel-perfect, non-drifting frame. This 16-pixel alignment is treated as
+// a general rule (a standard Metal/IOSurface linear-texture tiling boundary) rather than a
+// one-resolution special case, but it's only verified against this one device/resolution; if a
+// different simulator ever shows shearing (wrong constant) or slow vertical rolling (wrong
+// rounding direction/boundary), this is the first thing to re-check.
+const RAWVIDEO_TILE_ALIGNMENT_PX = 16;
+
+function roundUpToTileAlignment(value: number): number {
+  return Math.ceil(value / RAWVIDEO_TILE_ALIGNMENT_PX) * RAWVIDEO_TILE_ALIGNMENT_PX;
+}
+
+/**
+ * ffmpeg's `-i pipe:0`-facing flags, specific to the source format. `rawvideo` needs none of the
+ * H.264-specific probing workarounds below: its format/size are declared up front (via
+ * `-pixel_format`/`-video_size`), so there's no SPS/PPS or container timestamp to probe for in
+ * the first place — ffmpeg can start producing frames immediately. `-video_size` here is the
+ * *padded* width and height (see {@link roundUpToTileAlignment}), not the frame's real size — the
+ * constructor below adds a mandatory leading crop filter to strip that padding back off before
+ * anything else (the zoom crop, if any, and the final scale) runs. One thing rawvideo does *not*
+ * tolerate that Annex-B's start-code framing does: any desync between what this side of the pipe
+ * expects and what the source is actually sending (a partial write, or the framebuffer changing
+ * size mid-stream, e.g. a device rotation) corrupts every subsequent frame with no way to resync
+ * short of restarting the whole pipeline — out of scope for v1 (portrait-only).
+ */
+function buildInputArgs(source: FrameSourceDescriptor): string[] {
+  if (source.kind === 'rawvideo') {
+    const paddedWidth = roundUpToTileAlignment(source.width);
+    const paddedHeight = roundUpToTileAlignment(source.height);
+    return [
+      '-f',
+      'rawvideo',
+      '-pixel_format',
+      source.pixelFormat,
+      '-video_size',
+      `${String(paddedWidth)}x${String(paddedHeight)}`,
+      '-i',
+      'pipe:0',
+    ];
+  }
+  return [
+    // Deliberately no `-fflags nobuffer`: empirically (against this project's test emulator) it
+    // makes ffmpeg silently decode zero frames from this Annex-B stream, both from a file and
+    // piped live — presumably an interaction with how it buffers waiting for SPS/PPS.
+    // `-flags low_delay` alone (safe here since screenrecord's baseline-profile output has no
+    // B-frames to reorder) decodes correctly.
+    '-flags',
+    'low_delay',
+    // `-max_ts_probe 1` is the fix for a serious live-streaming bug found by tracing ffmpeg's own
+    // debug log: a raw H.264 Annex-B stream has no container-level timestamps, so
+    // avformat_find_stream_info()'s generic "wait for the first timestamp" logic keeps reading
+    // packets up to its default cap of 50 before ever producing a single output frame. Against
+    // this project's content-driven capture (near-zero new data while the screen is static — see
+    // ScreenrecordSource's own doc comment), reaching 50 real frames could take many seconds of
+    // active use, which reads as "the view is dead / not synced". Verified end to end: stream
+    // info now completes ~0.5s after motion starts (not 50 frames in), across five separate
+    // motion bursts over an 18s session, each producing frames within ~1-2s.
+    '-max_ts_probe',
+    '1',
+    // `fps_probe_size` (default 20 *frames*) is a second, independent probe counter that
+    // `-max_ts_probe` does not cover — avformat_find_stream_info() still waits to see this many
+    // frames before returning, even with the timestamp probe capped at 1. On this project's
+    // content-driven capture that can be many seconds of real interaction before the first output
+    // frame, which is the same "view is dead" symptom -max_ts_probe was added for above, just
+    // gated on a different counter. Verified: setting this to 0 was necessary (though not
+    // sufficient on its own — see the fps-filter removal note in PngFrameSplitter) to get any
+    // frame at all out of a live emulator that had gone idle.
+    '-fpsprobesize',
+    '0',
+    '-f',
+    'h264',
+    '-i',
+    'pipe:0',
+  ];
+}
+
 // A PNG's IEND chunk always has zero-length data, so its bytes are fixed: a 4-byte length of 0,
 // the ASCII type "IEND", and the CRC-32 of just that type string (0xAE426082 — the same for
 // every encoder, verified against this project's own PNG encoder). That makes it a reliable,
@@ -27,8 +122,9 @@ const IEND_TRAILER = Buffer.from([
 ]);
 
 /**
- * Spawns ffmpeg to decode an H.264 Annex-B stream and scale it to a fixed size, and splits its
- * `image2pipe`/PNG stdout back into individual frame buffers, emitted as `'frame'` events.
+ * Spawns ffmpeg to decode a raw device stream (H.264 Annex-B or rawvideo BGRA — see
+ * {@link buildInputArgs}) and scale it to a fixed size, and splits its `image2pipe`/PNG stdout
+ * back into individual frame buffers, emitted as `'frame'` events.
  */
 export class PngFrameSplitter extends EventEmitter {
   private ffmpeg: ChildProcessWithoutNullStreams;
@@ -61,6 +157,12 @@ export class PngFrameSplitter extends EventEmitter {
     // screencap-based staleness watchdog in stream.ts still exists and is not just a backstop for
     // rare cases; it's the only thing that can ever surface that last frame at all.
     const filters: string[] = [];
+    if (options.source.kind === 'rawvideo') {
+      // Strips the row-stride padding `-video_size` (above) declared to ffmpeg's input —
+      // unconditional and always first, whether or not zoom's own crop is also active, since
+      // it's correcting for how the *input* is laid out, not deciding what to show.
+      filters.push(`crop=${String(options.source.width)}:${String(options.source.height)}:0:0`);
+    }
     if (options.crop) {
       filters.push(
         `crop=${String(options.crop.width)}:${String(options.crop.height)}:${String(options.crop.x)}:${String(options.crop.y)}`,
@@ -71,39 +173,7 @@ export class PngFrameSplitter extends EventEmitter {
     this.ffmpeg = spawn(
       'ffmpeg',
       [
-        // Deliberately no `-fflags nobuffer`: empirically (against this project's test
-        // emulator) it makes ffmpeg silently decode zero frames from this Annex-B stream,
-        // both from a file and piped live — presumably an interaction with how it buffers
-        // waiting for SPS/PPS. `-flags low_delay` alone (safe here since screenrecord's
-        // baseline-profile output has no B-frames to reorder) decodes correctly.
-        '-flags',
-        'low_delay',
-        // `-max_ts_probe 1` is the fix for a serious live-streaming bug found by tracing
-        // ffmpeg's own debug log: a raw H.264 Annex-B stream has no container-level
-        // timestamps, so avformat_find_stream_info()'s generic "wait for the first
-        // timestamp" logic keeps reading packets up to its default cap of 50 before ever
-        // producing a single output frame. Against this project's content-driven capture
-        // (near-zero new data while the screen is static — see ScreenrecordSource's own
-        // doc comment), reaching 50 real frames could take many seconds of active use,
-        // which reads as "the view is dead / not synced". Verified end to end: stream info
-        // now completes ~0.5s after motion starts (not 50 frames in), across five separate
-        // motion bursts over an 18s session, each producing frames within ~1-2s.
-        '-max_ts_probe',
-        '1',
-        // `fps_probe_size` (default 20 *frames*) is a second, independent probe counter that
-        // `-max_ts_probe` does not cover — avformat_find_stream_info() still waits to see this
-        // many frames before returning, even with the timestamp probe capped at 1. On this
-        // project's content-driven capture that can be many seconds of real interaction before
-        // the first output frame, which is the same "view is dead" symptom -max_ts_probe was
-        // added for above, just gated on a different counter. Verified: setting this to 0 was
-        // necessary (though not sufficient on its own — see the fps-filter removal above) to get
-        // any frame at all out of a live emulator that had gone idle.
-        '-fpsprobesize',
-        '0',
-        '-f',
-        'h264',
-        '-i',
-        'pipe:0',
+        ...buildInputArgs(options.source),
         '-vf',
         filters.join(','),
         '-f',

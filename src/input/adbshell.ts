@@ -98,8 +98,40 @@ export class AdbShellInputBackend implements InputBackend {
     this.send(`input swipe ${rx1} ${ry1} ${rx2} ${ry2} ${rd}`);
   }
 
-  keyevent(code: string): void {
+  private keyevent(code: string): void {
     this.send(`input keyevent ${code}`);
+  }
+
+  back(): void {
+    this.keyevent('KEYCODE_BACK');
+  }
+
+  home(): void {
+    this.keyevent('KEYCODE_HOME');
+  }
+
+  recents(): void {
+    this.keyevent('KEYCODE_APP_SWITCH');
+  }
+
+  power(): void {
+    this.keyevent('KEYCODE_POWER');
+  }
+
+  volumeUp(): void {
+    this.keyevent('KEYCODE_VOLUME_UP');
+  }
+
+  volumeDown(): void {
+    this.keyevent('KEYCODE_VOLUME_DOWN');
+  }
+
+  enter(): void {
+    this.keyevent('KEYCODE_ENTER');
+  }
+
+  backspace(): void {
+    this.keyevent('KEYCODE_DEL');
   }
 
   text(value: string): void {

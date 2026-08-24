@@ -4,12 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-temu displays and drives an Android emulator/device as live pixels inside a terminal (typically a
-tmux pane), so the device sits next to a CLI AI agent instead of in a separate GUI window. No
-Electron, no GUI toolkit — just `adb` + `ffmpeg` + raw terminal escape sequences. There are no
-tests in this repo; correctness is established by reading the code's own doc comments (many
-encode specific measurements/verifications against a real emulator) and by manual runs against a
-live device.
+temu displays and drives an Android emulator/device or a booted iOS Simulator as live pixels
+inside a terminal (typically a tmux pane), so the device sits next to a CLI AI agent instead of
+in a separate GUI window. No Electron, no GUI toolkit — just `adb`/`sim-use` + `ffmpeg` + raw
+terminal escape sequences. There are no tests in this repo; correctness is established by reading
+the code's own doc comments (many encode specific measurements/verifications against a real
+emulator or simulator) and by manual runs against a live device.
+
+Android is the zero-extra-dependency path (`adb` + `ffmpeg` only). iOS requires `sim-use` on
+PATH: it's the only way to reach a simulator's private framebuffer/HID APIs (`xcrun simctl` alone
+has no input verb of any kind — verified directly against Xcode 26.6). See
+`src/device/target.ts` for the platform abstraction and `src/device/ios/simuse.ts` for why every
+sim-use call runs with `SIM_USE_NO_DAEMON=1`.
 
 ## Commands
 
@@ -33,20 +39,74 @@ suite, so these are how changes actually get checked):
 
 ```sh
 node dist/cli.js                          # or: npm run dev
-node dist/cli.js --device <serial> --bitrate 4M
+node dist/cli.js --device <serial> --bitrate 4M   # Android
+node dist/cli.js --device <udid>                  # iOS Simulator (auto-detected by UUID shape)
+node dist/cli.js --platform ios                   # disambiguate without naming a device/udid
 node dist/cli.js tmux --percent 40
 node dist/cli.js doctor [--fix] [--no-render-test]
-adb devices                               # confirm a target device/emulator is attached
+adb devices                               # confirm a target Android device/emulator is attached
+xcrun simctl list devices booted          # confirm a target iOS Simulator is booted
+sim-use devices                           # confirm sim-use can see both
 ```
 
 ## Architecture
 
+### Platform abstraction
+
+- `src/device/target.ts` — the `DeviceTarget` interface `stream.ts` actually drives, plus
+  `resolveTarget`, which decides whether `--device`/`--platform` (or an auto-scan of both
+  platforms when neither is given) means Android or iOS. A `DeviceTarget` exposes two pixel
+  sizes that matter for different reasons: `capturePx` (native framebuffer pixels — what
+  ffmpeg/rendering size against) and `inputSize` (the coordinate space `tap`/`swipe`/hint bounds
+  are expressed in). These are identical on Android; on iOS `inputSize` is UIKit points, about a
+  third the magnitude of `capturePx` on a Retina simulator — `src/stream.ts` converts explicitly
+  at the one place it matters (`zoomRegionToCapturePx`, since ffmpeg's crop filter only
+  understands native pixels) and otherwise never mixes the two spaces.
+- `src/device/android-target.ts` — thin `DeviceTarget` adapter over the pieces that existed
+  before this abstraction did (`ScreenrecordSource`, `captureScreencapPng`, `getDeviceGeometry`,
+  `AdbShellInputBackend`, uiautomator-based hints). No behavior change from before this
+  abstraction existed.
+- `src/device/ios/` — the iOS `DeviceTarget` (`target.ts`, assembled from this directory's other
+  files):
+  - `simuse.ts` — the one place that spawns `sim-use`. Always sets `SIM_USE_NO_DAEMON=1`:
+    measured on this project's dev machine, sim-use's own background daemon adds a flat ~5s to
+    every call (amortization that never pays off here, since temu issues one input command at a
+    time rather than a rapid-fire sequence) vs ~0.15s for a bare HID call without it.
+  - `discover.ts` — booted-simulator listing (`sim-use devices --platform ios`) and geometry:
+    `capturePx` from decoding a seed screenshot's own PNG IHDR (authoritative for whatever the
+    framebuffer's actual current size is), `inputSize` from the device type's `profile.plist`
+    (`mainScreenScale`), falling back to `sim-use ui`'s reported screen size if that plist lookup
+    fails for any reason.
+  - `capture.ts` — `BgraFramebufferSource` spawns `sim-use stream-video --format bgra`, the
+    private `SimDisplayIOSurface`/framebuffer path (not screenshot polling) — content-driven like
+    Android's `ScreenrecordSource`: measured at ~1.5 frames per 6s on an idle screen, vs a
+    constant ~9.6fps for sim-use's screenshot-polling formats. `--scale 1.0` always — sim-use's
+    own scaling measurably halved throughput in testing, and ffmpeg already has to scale/crop
+    regardless.
+  - `input.ts` — `SimUseInputBackend`: one `sim-use` child process per input event, queued and
+    run strictly one at a time (no persistent-session equivalent of `adb shell` exists — `sim-use
+ios batch --stdin` was verified to slurp its stdin to EOF before executing a single step, so
+    it can't serve as one). Live per-pixel dragging isn't reproducible at ~0.15-0.25s/call, so
+    drags coalesce into one `swipe` from the recorded start position to the release point over
+    the elapsed real time, instead of replaying real intermediate positions.
+  - `hints.ts` — hint mode's iOS data source: `sim-use ui`'s accessibility outline mapped onto
+    the same `HintTarget` shape `src/input/hints.ts` defines for Android, reusing that file's
+    `generateLabels`/`renderHintOverlay` unchanged.
+- `src/input/backend.ts` — `InputBackend`: semantic methods (`back`/`home`/`recents`/`power`/
+  `volumeUp`/`volumeDown`/`enter`/`backspace`), not an Android-`KEYCODE_*`-shaped escape hatch —
+  so the iOS backend can map what it can (home/lock/an edge-swipe for back) and let
+  `DeviceTarget.supports()` report the rest (recents, volume — no sim-use primitive exists for
+  either) so `stream.ts` can show an honest "not available" toast instead of a silent no-op.
+
 ### Pipeline: device pixels -> terminal pixels
 
 ```
-adb screenrecord (h264) -> PassThrough -> ffmpeg (decode+scale+PNG) -> IEND-split frames
+Android: adb screenrecord (h264)         -\
+iOS:     sim-use stream-video --format bgra -> PassThrough -> ffmpeg (decode+crop+scale+PNG)
                                                                               |
-                                                     screencap watchdog ------+
+                                                                    IEND-split frames
+                                                                              |
+                                                      snapshot watchdog ------+
                                                      (fills stalled/first frames)
                                                                               v
                                                         KittyRenderer / BlocksRenderer
@@ -57,32 +117,42 @@ adb screenrecord (h264) -> PassThrough -> ffmpeg (decode+scale+PNG) -> IEND-spli
   long-lived `PassThrough` that survives the underlying adb process restarting (screenrecord
   exits/restarts are treated as normal, not exceptional). `captureScreencapPng` /
   `ScreencapPollSource` are the PNG-polling fallback path (also used directly for the `s`/`S`
-  screenshot keys and for seeding/patching a stalled live view — see below).
-- `src/device/transcode.ts` — `PngFrameSplitter` spawns ffmpeg to decode that Annex-B stream and
-  scale it, then splits ffmpeg's concatenated `image2pipe` PNG stdout back into per-frame buffers
-  by scanning for the PNG `IEND` trailer (a fixed 12-byte sequence). The ffmpeg flags here
-  (`-flags low_delay`, `-max_ts_probe 1`, `-fpsprobesize 0`, no `-fflags nobuffer`, no `fps=N`
-  filter) each fix a specific empirically-verified stall/latency bug on a _live, unterminated_
-  Annex-B pipe — read the comments before changing any of them, they're not arbitrary tuning.
-  `scalePng` is a separate one-shot ffmpeg invocation used to rescale a screencap PNG to match the
-  live pipeline's current output size.
-- **Structural limitation to know before touching this pipeline**: raw H.264 Annex-B has no
+  screenshot keys and for seeding/patching a stalled live view — see below). The iOS equivalent,
+  `BgraFramebufferSource` (`src/device/ios/capture.ts`), has the exact same restart-on-exit shape.
+- `src/device/transcode.ts` — `PngFrameSplitter` spawns ffmpeg to decode a raw device stream
+  (Android's H.264 Annex-B, or iOS's rawvideo BGRA — `TranscodeOptions.source` picks ffmpeg's
+  input-side flags via `buildInputArgs`) and scale it, then splits ffmpeg's concatenated
+  `image2pipe` PNG stdout back into per-frame buffers by scanning for the PNG `IEND` trailer (a
+  fixed 12-byte sequence). The Annex-B-specific ffmpeg flags (`-flags low_delay`,
+  `-max_ts_probe 1`, `-fpsprobesize 0`, no `-fflags nobuffer`, no `fps=N` filter) each fix a
+  specific empirically-verified stall/latency bug on a _live, unterminated_ Annex-B pipe — read
+  the comments before changing any of them, they're not arbitrary tuning. rawvideo needs none of
+  those (its format/size are declared up front via `-pixel_format`/`-video_size`, so there's
+  nothing to probe for) but tolerates zero desync — a framebuffer resize (e.g. rotation) corrupts
+  every subsequent frame with no way to resync short of rebuilding the pipeline; out of scope for
+  v1 (portrait-only). `scalePng` is a separate one-shot ffmpeg invocation used to rescale a
+  snapshot PNG to match the live pipeline's current output size.
+- **Structural limitation to know before touching the Android path**: raw H.264 Annex-B has no
   end-of-access-unit marker, so ffmpeg's demuxer can only tell a frame is complete once it sees
   the _next_ NAL's start code, or EOF. On a live pipe, a genuinely final frame (screen changes
   once, then holds still — e.g. a popup that appears and stays) has no successor and is **never**
-  emitted by ffmpeg, with or without flag tuning. This is why the screencap watchdog below exists
-  and is load-bearing, not a rare fallback.
+  emitted by ffmpeg, with or without flag tuning. This is why the snapshot watchdog below exists
+  and is load-bearing, not a rare fallback. iOS's bgra stream is content-driven the same way (no
+  frame at all while the screen is static) and leans on the exact same watchdog for the same
+  reason, even though its underlying cause (no Annex-B framing at all) is different.
 - `src/stream.ts` — the main render/input loop and the piece that ties everything else together.
   Owns one `Pipeline` (capture source + `PngFrameSplitter`) at a time, rebuilding it whenever
-  capture resolution needs to change (pane resize, zoom toggle — neither screenrecord nor ffmpeg
-  can be resized in place). Runs a fixed-interval render tick (`1000 / fpsCap`, adjustable live via
-  `+`/`-`) that always renders the newest available frame and drops older ones — this, not
-  ffmpeg's own rate, is what the fps cap now controls, since the `fps=N` output filter was removed
-  from the ffmpeg pipeline. Each tick also calls `refreshFromScreencapIfStale`: if no live frame
-  has arrived for `STALE_FRAME_THRESHOLD_MS`, it takes one `screencap` snapshot and displays that
-  instead — the only mechanism that can surface a frame stuck by the Annex-B limitation above.
-  Also wires up the keyboard/mouse handlers, the crosshair, hint mode, zoom, and the asleep-display
-  toast (`isDisplayOn`).
+  capture resolution needs to change (pane resize, zoom toggle — none of screenrecord, sim-use's
+  framebuffer stream, or ffmpeg can be resized in place). Runs a fixed-interval render tick
+  (`1000 / fpsCap`, adjustable live via `+`/`-`) that always renders the newest available frame
+  and drops older ones — this, not the capture source's own rate, is what the fps cap controls.
+  Each tick also calls `refreshFromScreencapIfStale`: if no live frame has arrived for
+  `STALE_FRAME_THRESHOLD_MS`, it takes one platform-appropriate snapshot
+  (`DeviceTarget.snapshotPng`) and displays that instead — the only mechanism that can surface a
+  frame stuck by either platform's own capture limitation. Also wires up the keyboard/mouse
+  handlers, the crosshair, hint mode, zoom, and the asleep-display toast (`isDisplayOn` — always
+  `true` on iOS, since a locked simulator still renders a lock screen rather than going dark the
+  way a sleeping Android display does).
 
 ### Rendering
 
@@ -102,9 +172,12 @@ adb screenrecord (h264) -> PassThrough -> ffmpeg (decode+scale+PNG) -> IEND-spli
   heuristic (env-var-based) fallback when queries aren't possible (non-interactive, or tmux would
   swallow them). Nothing else in the codebase should be probing terminal capabilities directly.
 - `src/render/geometry.ts` — pure math: fitting the device's native aspect ratio into the pane's
-  available cell grid (`fitDeviceToCells`, also picks the capture resolution screenrecord should
-  target), and converting between terminal cell coordinates and device pixel coordinates in both
-  directions, including through an active zoom region.
+  available cell grid (`fitDeviceToCells`, also picks the capture resolution to request), and
+  converting between terminal cell coordinates and "device pixel" coordinates in both directions,
+  including through an active zoom region. Doesn't know or care whether "device pixel" means
+  actual pixels (Android) or UIKit points (iOS) — it just linearly maps whatever width/height
+  numbers `stream.ts` passes in (`DeviceTarget.inputSize`), which is why this file needed no
+  changes at all to support a second platform.
 - `src/render/png.ts` — a minimal dependency-free PNG encoder/decoder (no image library
   dependency). The encoder exists for `doctor`'s self-test pattern; the decoder exists only to
   back the block-renderer fallback, which needs raw pixels rather than an opaque PNG buffer.
@@ -117,32 +190,47 @@ adb screenrecord (h264) -> PassThrough -> ffmpeg (decode+scale+PNG) -> IEND-spli
 
 - `src/input/mouse.ts` — decodes SGR mouse reports (`CSI < Cb;Cx;Cy M/m`) into
   tap/drag-start/drag-move/drag-end/wheel/right-click callbacks, in terminal cell coordinates.
-  Buffers a possibly-split escape sequence across `feed()` calls.
+  Buffers a possibly-split escape sequence across `feed()` calls. Platform-agnostic: it hands
+  `stream.ts` cell coordinates, which get converted to whichever `DeviceTarget.inputSize` space
+  is in play.
 - `src/input/keymap.ts` — a small modal keyboard state machine (`normal` / `text` / `hint`
   modes) decoding raw stdin bytes left over after `MouseTracker` takes its share. Handles the
   ESC-vs-CSI-prefix ambiguity with a short timeout rather than guessing.
-- `src/input/hints.ts` — hint mode (`f`): dumps the live accessibility tree via
+- `src/input/hints.ts` — hint mode (`f`) on Android: dumps the live accessibility tree via
   `adb exec-out uiautomator dump /dev/tty`, parses clickable element bounds, and assigns short
   letter labels so the caller can tap a labeled element's exact center in device pixels —
-  sidesteps the coarse cell-grid resolution of mouse-driven tapping entirely.
-- `src/input/adbshell.ts` — `AdbShellInputBackend`, the one production `InputBackend`
-  (`src/input/backend.ts`). Drives Android's `input` command through one persistent `adb shell`
-  session rather than spawning a process per call (a naive per-call approach measured
-  ~250-600ms/tap from adb transport overhead alone; a persistent shell amortizes that to
-  ~21ms/call). Raw evdev injection was the original design but is blocked by SELinux under stock
-  AOSP policy — not just slow, actually denied — so don't reintroduce that path without solving
-  that first.
+  sidesteps the coarse cell-grid resolution of mouse-driven tapping entirely. Also exports
+  `generateLabels`/`renderHintOverlay`/the `HintTarget` shape, reused as-is by
+  `src/device/ios/hints.ts` for the iOS equivalent (`sim-use ui`'s accessibility outline).
+- `src/input/backend.ts` — `InputBackend`: the semantic (not Android-keycode-shaped) interface
+  both platforms' input backends implement — see "Platform abstraction" above for why.
+- `src/input/adbshell.ts` — `AdbShellInputBackend`, the Android `InputBackend`. Drives Android's
+  `input` command through one persistent `adb shell` session rather than spawning a process per
+  call (a naive per-call approach measured ~250-600ms/tap from adb transport overhead alone; a
+  persistent shell amortizes that to ~21ms/call). Raw evdev injection was the original design but
+  is blocked by SELinux under stock AOSP policy — not just slow, actually denied — so don't
+  reintroduce that path without solving that first. `src/device/ios/input.ts`'s
+  `SimUseInputBackend` is the iOS counterpart — no persistent-session equivalent exists there
+  (see "Platform abstraction" above), so it pays sim-use's ~0.15-0.25s per-call cost directly,
+  queued through one serial queue rather than a shared shell.
 
 ### Entry points
 
 - `src/cli.ts` — argv dispatch only (`temu`, `temu doctor`, `temu tmux`); no logic of its own.
+  Any other leading `--flag` (not just a fixed `--device`/`--bitrate` allowlist) routes to the
+  default streaming command — `src/stream.ts`'s own arg parser is the single source of truth for
+  which flags exist.
 - `src/stream.ts` — default command (streaming/interactive session).
 - `src/doctor.ts` — environment/capability checks (adb/ffmpeg/tmux presence, tmux
-  allow-passthrough, terminal cell size, Kitty graphics support) plus an interactive render
-  self-test; `--fix` offers to turn on tmux's `allow-passthrough`.
+  allow-passthrough, terminal cell size, Kitty graphics support, and on macOS: xcrun/sim-use
+  presence plus booted simulators) plus an interactive render self-test; `--fix` offers to turn
+  on tmux's `allow-passthrough`. iOS checks are all `warn`, never `fail` — iOS support is
+  optional and a missing `sim-use` shouldn't make an Android-only machine's doctor run look
+  broken.
 - `src/tmuxlayout.ts` — `temu tmux`: splits the current tmux window and re-execs the same
   node binary/script in the new pane with the same argv shape (not a shell string — the target
   pane's shell may not be POSIX sh, so args are passed as an argv array to avoid quoting bugs).
+  Forwards `--device`/`--platform` through to the new pane's invocation.
 
 ## Conventions worth knowing
 
@@ -151,8 +239,10 @@ adb screenrecord (h264) -> PassThrough -> ffmpeg (decode+scale+PNG) -> IEND-spli
   it, handle the `undefined` case.
 - ESM throughout (`"type": "module"`, `verbatimModuleSyntax`, NodeNext resolution) — internal
   imports use explicit `.js` extensions even though the source is `.ts`.
-- No runtime dependencies (`package.json` `dependencies` is empty) — this is intentional
-  (self-contained, `adb` + `ffmpeg` on `PATH` is the whole external surface). Think twice before
-  adding one, especially for something (like PNG encode/decode) this codebase already implements
-  itself for exactly that reason.
+- No runtime _npm_ dependencies (`package.json` `dependencies` is empty) — this is intentional
+  (self-contained; think twice before adding one, especially for something like PNG encode/decode
+  this codebase already implements itself for exactly that reason). The external surface is
+  `adb` + `ffmpeg` on `PATH` for Android, plus `sim-use` on `PATH` for iOS (required only when
+  attaching to an iOS Simulator target — see "What this is" above for why there's no
+  zero-dependency alternative there).
 - Prettier: single quotes, semicolons, trailing commas, 100-char print width.

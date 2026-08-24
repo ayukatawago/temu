@@ -1,27 +1,25 @@
-// `temu` / `temu --device <serial>`: the live streaming render loop. Attaches to a device,
-// works out how big a grid fits the current pane, and pumps frames from screenrecord through
-// ffmpeg into the Kitty-graphics renderer until the user quits. Also wires up mouse-driven
-// tap/drag/scroll/back (input/mouse.ts + input/adbshell.ts) and the modal keyboard (crosshair
-// nudge, hardware buttons, text entry, hint mode, zoom).
+// `temu` / `temu --device <id>`: the live streaming render loop. Attaches to an Android device
+// or a booted iOS Simulator (src/device/target.js's `resolveTarget` decides which), works out
+// how big a grid fits the current pane, and pumps frames from the platform's capture source
+// (adb screenrecord, or sim-use's bgra framebuffer stream) through ffmpeg into the
+// Kitty-graphics renderer until the user quits. Also wires up mouse-driven tap/drag/scroll/back
+// (input/mouse.ts + a per-platform InputBackend) and the modal keyboard (crosshair nudge,
+// hardware buttons, text entry, hint mode, zoom) — none of which know or care which platform is
+// actually on the other end.
 
 import { writeFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
-import { captureScreencapPng, ScreenrecordSource } from './device/capture.js';
 import {
-  getDeviceGeometry,
-  isDisplayOn,
-  pickDefaultDevice,
-  type DeviceGeometry,
-} from './device/discover.js';
+  resolveTarget,
+  type CaptureHandle,
+  type DeviceTarget,
+  type InputFeature,
+  type Platform,
+  type PixelSize,
+} from './device/target.js';
 import { PngFrameSplitter, scalePng } from './device/transcode.js';
-import { AdbShellInputBackend } from './input/adbshell.js';
 import type { InputBackend } from './input/backend.js';
-import {
-  dumpUiHierarchy,
-  parseHintTargets,
-  renderHintOverlay,
-  type HintTarget,
-} from './input/hints.js';
+import { renderHintOverlay, type HintTarget } from './input/hints.js';
 import { KeyboardHandler, type KeyboardMode } from './input/keymap.js';
 import { MouseTracker } from './input/mouse.js';
 import { BlocksRenderer } from './render/blocks.js';
@@ -39,31 +37,41 @@ import { KittyRenderer } from './render/kitty.js';
 
 export interface StreamOptions {
   device?: string | undefined;
+  platform?: Platform | undefined;
   bitrate: string;
 }
 
 export function parseStreamArgs(argv: string[]): StreamOptions {
   let device: string | undefined;
+  let platform: Platform | undefined;
   let bitrate = '8M';
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--device') {
       device = argv[++i];
+    } else if (arg === '--platform') {
+      const value = argv[++i];
+      if (value === 'ios' || value === 'android') {
+        platform = value;
+      }
     } else if (arg === '--bitrate') {
       bitrate = argv[++i] ?? bitrate;
     }
   }
-  return { device, bitrate };
+  return { device, platform, bitrate };
 }
 
 const STATUS_BAR_ROWS = 1;
 const RESIZE_DEBOUNCE_MS = 150;
 
 export interface PipelineOptions {
-  /** What screenrecord is told to encode at (`--size`). */
-  capturePx: { width: number; height: number };
+  /** What the platform's capture source is asked to encode at — a request Android's screenrecord
+   * honors via `--size`; iOS's bgra framebuffer stream ignores it entirely (always native — see
+   * src/device/ios/target.ts) since ffmpeg's own scale filter (`outputPx` below) already has to
+   * do the size adaptation on that platform regardless. */
+  capturePx: PixelSize;
   /** What ffmpeg scales (post-crop, if any) down to — always the on-screen target size. */
-  outputPx: { width: number; height: number };
+  outputPx: PixelSize;
   /**
    * Sub-rectangle of the *captured* frame to crop to before scaling, in capture-pixel
    * coordinates. Used by zoom mode, which restarts the whole pipeline at full native capture
@@ -76,37 +84,35 @@ export interface PipelineOptions {
 /**
  * Owns one running (capture -> transcode) pipeline at a fixed capture resolution, and knows how
  * to tear itself down and be replaced by a new one — the only way to change the resolution
- * screenrecord/ffmpeg are working at, since neither can be resized in place. Resize *and* zoom
- * both work by tearing down and rebuilding one of these with different options.
+ * capture/ffmpeg are working at, since none of Android's screenrecord, iOS's framebuffer stream,
+ * or ffmpeg itself can be resized in place. Resize *and* zoom both work by tearing down and
+ * rebuilding one of these with different options. Platform-agnostic: `target.createCapture`
+ * hides whether it's spawning `adb screenrecord` or `sim-use stream-video --format bgra`.
  */
 class Pipeline {
-  private readonly capture: ScreenrecordSource;
+  private readonly capture: CaptureHandle;
   private splitter: PngFrameSplitter;
   private stopped = false;
 
   constructor(
-    private readonly serial: string,
+    private readonly target: DeviceTarget,
     private readonly options: PipelineOptions,
     private readonly bitrate: string,
     private readonly onFrame: (png: Buffer) => void,
     private readonly onLog: (message: string) => void,
   ) {
-    this.capture = new ScreenrecordSource({
-      serial,
-      width: options.capturePx.width,
-      height: options.capturePx.height,
-      bitrate,
-    });
-    this.capture.on('restart', (event: { code: number | null; count: number }) => {
+    this.capture = target.createCapture({ requestedPx: options.capturePx, bitrate });
+    this.capture.onRestart((event) => {
       this.onLog(
-        `screenrecord restarted (attempt ${event.count}, exit code ${String(event.code)})`,
+        `capture restarted (attempt ${String(event.count)}, exit code ${String(event.code)})`,
       );
     });
     this.splitter = this.attachSplitter();
   }
 
   private attachSplitter(): PngFrameSplitter {
-    const splitter = new PngFrameSplitter(this.capture.h264, {
+    const splitter = new PngFrameSplitter(this.capture.readable, {
+      source: this.capture.format,
       width: this.options.outputPx.width,
       height: this.options.outputPx.height,
       ...(this.options.crop ? { crop: this.options.crop } : {}),
@@ -182,18 +188,25 @@ function currentAvailableCells(originRow: number): { cols: number; rows: number 
   return { cols, rows };
 }
 
-/** Wheel-to-swipe geometry: a short vertical drag centered on the pointer, in device pixels. */
-const WHEEL_SWIPE_HALF_HEIGHT_PX = 220;
+/**
+ * Wheel-to-swipe geometry: a short vertical drag centered on the pointer. Expressed as a
+ * fraction of the input space's height rather than a fixed pixel count — `inputSize` is device
+ * pixels on Android but UIKit points on iOS (roughly a third the magnitude for the same physical
+ * screen, see src/device/ios/target.ts), so an absolute constant tuned for one would be wildly
+ * wrong for the other.
+ */
+const WHEEL_SWIPE_HALF_HEIGHT_FRACTION = 0.1;
 const WHEEL_SWIPE_DURATION_MS = 120;
 
 function setUpMouse(
   input: InputBackend,
   origin: GridOrigin,
   getFit: () => FitResult,
-  geometry: DeviceGeometry,
+  inputSize: PixelSize,
 ): MouseTracker {
   const toDevicePx = (col: number, row: number): { x: number; y: number } =>
-    cellToDevicePixel(col, row, origin, getFit(), geometry.width, geometry.height);
+    cellToDevicePixel(col, row, origin, getFit(), inputSize.width, inputSize.height);
+  const wheelHalfHeight = inputSize.height * WHEEL_SWIPE_HALF_HEIGHT_FRACTION;
 
   return new MouseTracker({
     onTap: (col, row) => {
@@ -218,12 +231,12 @@ function setUpMouse(
       // down the page, i.e. the on-screen content moves up — a swipe from below to above.
       const [y1, y2] =
         direction === 'up'
-          ? [y + WHEEL_SWIPE_HALF_HEIGHT_PX, y - WHEEL_SWIPE_HALF_HEIGHT_PX]
-          : [y - WHEEL_SWIPE_HALF_HEIGHT_PX, y + WHEEL_SWIPE_HALF_HEIGHT_PX];
+          ? [y + wheelHalfHeight, y - wheelHalfHeight]
+          : [y - wheelHalfHeight, y + wheelHalfHeight];
       input.swipe(x, y1, x, y2, WHEEL_SWIPE_DURATION_MS);
     },
     onRightClick: () => {
-      input.keyevent('KEYCODE_BACK');
+      input.back();
     },
   });
 }
@@ -240,20 +253,44 @@ const CROSSHAIR_BIG_STEP_MULTIPLIER = 5;
 const DEFAULT_FPS_CAP = 20;
 const MIN_FPS_CAP = 1;
 const MAX_FPS_CAP = 30;
-/** Zoom shows 1/ZOOM_FACTOR of the device's width and height, magnified to fill the same grid. */
+/** Zoom shows 1/ZOOM_FACTOR of the device's input space, magnified to fill the same grid. */
 const ZOOM_FACTOR = 3;
 /**
- * How long the live H.264 pipeline can go without producing a new frame before it's treated as
- * stuck and a corrective `screencap` is taken instead. This is still the *primary* mechanism for
+ * How long the live capture pipeline can go without producing a new frame before it's treated as
+ * stuck and a corrective snapshot is taken instead. This is still the *primary* mechanism for
  * "the screen changed once and then held still" (e.g. a popup) — not a rare backstop. Raw H.264
  * Annex-B has no end-of-access-unit marker, so ffmpeg's parser only knows a frame is complete
  * once it sees the start of the *next* one (or EOF); a genuinely final frame on a live, open
  * pipe has neither, and stays parsed-but-unemitted forever no matter how the demuxer/filters are
  * tuned (verified: even with transcode.ts's fps-filter removal and `-fpsprobesize 0`, the true
  * final frame of a feed-then-go-silent sequence was never emitted). This watchdog is the only
- * thing that can surface that frame at all.
+ * thing that can surface that frame at all. iOS's bgra framebuffer stream is content-driven the
+ * same way (see src/device/ios/capture.ts) and benefits from the exact same watchdog.
  */
 const STALE_FRAME_THRESHOLD_MS = 1500;
+
+/**
+ * Zoom's crosshair math (crosshair position, `computeZoomRegion`) all runs in the target's input
+ * space — device pixels on Android, UIKit points on iOS — since that's what the crosshair and
+ * hint-mode coordinates are already in. ffmpeg's crop filter, however, always operates on the
+ * actual captured frame, which is native device pixels on both platforms. On Android those two
+ * spaces are identical (this is a no-op); on iOS they differ by the screen's point-to-pixel
+ * scale (3x on this project's test simulator), so the region has to be scaled up before it can
+ * be used as a crop rectangle.
+ */
+function zoomRegionToCapturePx(
+  region: ZoomRegion,
+  target: DeviceTarget,
+): { x: number; y: number; width: number; height: number } {
+  const scaleX = target.capturePx.width / target.inputSize.width;
+  const scaleY = target.capturePx.height / target.inputSize.height;
+  return {
+    x: Math.round(region.x * scaleX),
+    y: Math.round(region.y * scaleY),
+    width: Math.round(region.width * scaleX),
+    height: Math.round(region.height * scaleY),
+  };
+}
 
 export interface KeyboardSetup {
   keyboard: KeyboardHandler;
@@ -264,15 +301,15 @@ export interface KeyboardSetup {
 
 /**
  * Wires the modal keyboard's commands up to the input backend, a crosshair position tracked in
- * device pixels, the status bar, the help overlay, and hint mode. Zoom is the one command this
- * doesn't fully own: rebuilding the capture pipeline at a different resolution is runStream's
- * job (it owns `Pipeline`), so `onZoomRequested` just reports where the crosshair was when `z`
- * was pressed and leaves the rest to the caller.
+ * the target's input coordinate space (device pixels on Android, points on iOS), the status
+ * bar, the help overlay, and hint mode. Zoom is the one command this doesn't fully own:
+ * rebuilding the capture pipeline at a different resolution is runStream's job (it owns
+ * `Pipeline`), so `onZoomRequested` just reports where the crosshair was when `z` was pressed
+ * and leaves the rest to the caller.
  */
 function setUpKeyboard(
   input: InputBackend,
-  serial: string,
-  geometry: DeviceGeometry,
+  target: DeviceTarget,
   getFit: () => FitResult,
   origin: GridOrigin,
   renderer: FrameRenderer,
@@ -280,7 +317,8 @@ function setUpKeyboard(
   onQuit: () => void,
   onZoomRequested: (centerX: number, centerY: number) => void,
 ): KeyboardSetup {
-  let crosshair = { x: Math.round(geometry.width / 2), y: Math.round(geometry.height / 2) };
+  const { inputSize } = target;
+  let crosshair = { x: Math.round(inputSize.width / 2), y: Math.round(inputSize.height / 2) };
   let fpsCap = DEFAULT_FPS_CAP;
   let helpVisible = false;
   let hintTargets: HintTarget[] = [];
@@ -298,32 +336,44 @@ function setUpKeyboard(
     keyboard.exitHintMode();
   };
 
+  // Some InputBackend methods have no primitive on every platform (no iOS equivalent of
+  // Android's recents/volume keys — see src/device/ios/input.ts); this shows an honest toast
+  // instead of silently sending a command that does nothing.
+  const gate = (feature: InputFeature, label: string, action: () => void): void => {
+    if (target.supports(feature)) {
+      action();
+      return;
+    }
+    statusBar.showToast(`${label}: not available on ${target.platform}`, 2000);
+  };
+
   const keyboard = new KeyboardHandler({
     onQuit,
     onMoveCrosshair: (dx, dy, big) => {
       const fit = getFit();
       const multiplier = big ? CROSSHAIR_BIG_STEP_MULTIPLIER : 1;
-      const stepX = Math.max(1, Math.round(geometry.width / fit.cols)) * multiplier;
-      const stepY = Math.max(1, Math.round(geometry.height / fit.rows)) * multiplier;
+      const stepX = Math.max(1, Math.round(inputSize.width / fit.cols)) * multiplier;
+      const stepY = Math.max(1, Math.round(inputSize.height / fit.rows)) * multiplier;
       crosshair = {
-        x: Math.min(geometry.width - 1, Math.max(0, crosshair.x + dx * stepX)),
-        y: Math.min(geometry.height - 1, Math.max(0, crosshair.y + dy * stepY)),
+        x: Math.min(inputSize.width - 1, Math.max(0, crosshair.x + dx * stepX)),
+        y: Math.min(inputSize.height - 1, Math.max(0, crosshair.y + dy * stepY)),
       };
       statusBar.setCrosshair(crosshair);
     },
     onTapCrosshair: () => {
       input.tap(crosshair.x, crosshair.y);
     },
-    onBack: () => input.keyevent('KEYCODE_BACK'),
-    onHome: () => input.keyevent('KEYCODE_HOME'),
-    onRecents: () => input.keyevent('KEYCODE_APP_SWITCH'),
-    onPower: () => input.keyevent('KEYCODE_POWER'),
-    onVolumeUp: () => input.keyevent('KEYCODE_VOLUME_UP'),
-    onVolumeDown: () => input.keyevent('KEYCODE_VOLUME_DOWN'),
+    onBack: () => gate('back', 'back', () => input.back()),
+    onHome: () => gate('home', 'home', () => input.home()),
+    onRecents: () => gate('recents', 'recents', () => input.recents()),
+    onPower: () => gate('power', 'power', () => input.power()),
+    onVolumeUp: () => gate('volume', 'volume', () => input.volumeUp()),
+    onVolumeDown: () => gate('volume', 'volume', () => input.volumeDown()),
     onScreenshot: (announcePath) => {
       const filename = `temu-screenshot-${new Date().toISOString().replaceAll(/[:.]/g, '-')}.png`;
       const fullPath = resolvePath(filename);
-      captureScreencapPng(serial)
+      target
+        .snapshotPng()
         .then((png) => writeFile(fullPath, png))
         .then(() => {
           statusBar.showToast(announcePath ? `saved: ${fullPath}` : `saved: ${filename}`, 4000);
@@ -352,15 +402,15 @@ function setUpKeyboard(
       statusBar.setMode(mode);
     },
     onTextChar: (chars) => input.text(chars),
-    onTextBackspace: () => input.keyevent('KEYCODE_DEL'),
-    onTextEnter: () => input.keyevent('KEYCODE_ENTER'),
+    onTextBackspace: () => input.backspace(),
+    onTextEnter: () => input.enter(),
     onEnterHintMode: () => {
       hintBuffer = '';
       hintActive = false;
       statusBar.showToast('computing hints…', 15000);
-      dumpUiHierarchy(serial)
-        .then((xml) => {
-          const targets = parseHintTargets(xml);
+      target
+        .hintTargets()
+        .then((targets) => {
           if (targets.length === 0) {
             statusBar.showToast('no clickable elements found', 2000);
             finishHint();
@@ -369,7 +419,7 @@ function setUpKeyboard(
           hintTargets = targets;
           hintActive = true;
           const fit = getFit();
-          renderHintOverlay(targets, origin, fit, geometry.width, geometry.height);
+          renderHintOverlay(targets, origin, fit, inputSize.width, inputSize.height);
           statusBar.showToast(
             `hint: ${String(targets.length)} targets — type a label, Esc cancels`,
             15000,
@@ -386,13 +436,14 @@ function setUpKeyboard(
         return; // dump still in flight — ignore keys typed too early
       }
       hintBuffer += char.toLowerCase();
-      const matches = hintTargets.filter((target) => target.label.startsWith(hintBuffer));
+      // Named `candidate` rather than `target` here to avoid shadowing the outer DeviceTarget.
+      const matches = hintTargets.filter((candidate) => candidate.label.startsWith(hintBuffer));
       if (matches.length === 0) {
         statusBar.showToast('no match', 1200);
         finishHint();
         return;
       }
-      const exact = matches.find((target) => target.label === hintBuffer);
+      const exact = matches.find((candidate) => candidate.label === hintBuffer);
       if (exact && matches.length === 1) {
         const cx = (exact.bounds.x1 + exact.bounds.x2) / 2;
         const cy = (exact.bounds.y1 + exact.bounds.y2) / 2;
@@ -425,25 +476,18 @@ export async function runStream(argv: string[]): Promise<number> {
     return 1;
   }
 
-  let serial: string;
+  let target: DeviceTarget;
   try {
-    serial = await pickDefaultDevice(options.device);
+    target = await resolveTarget(options.device, options.platform);
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     return 1;
   }
 
-  let geometry: DeviceGeometry;
-  try {
-    geometry = await getDeviceGeometry(serial);
-  } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
-    return 1;
-  }
-
-  // Run alongside detectCaps rather than after it — it's a diagnostic check (see isDisplayOn's
-  // doc comment), so it shouldn't add its own wall-clock delay to startup.
-  const [caps, displayOn] = await Promise.all([detectCaps(), isDisplayOn(serial)]);
+  // Run alongside detectCaps rather than after it — it's a diagnostic check (see
+  // DeviceTarget.isDisplayOn's implementations), so it shouldn't add its own wall-clock delay to
+  // startup.
+  const [caps, displayOn] = await Promise.all([detectCaps(), target.isDisplayOn()]);
   // 'unknown' (heuristic couldn't tell) is treated optimistically — try Kitty graphics anyway.
   // Only a confirmed 'false' falls back, since the fallback is a real quality trade-off.
   const useBlocks = caps.kittyGraphicsSupported === false;
@@ -473,9 +517,7 @@ export async function runStream(argv: string[]): Promise<number> {
   // first (see currentAvailableCells' doc comment), and gridOrigin has to be queried as the
   // *last* thing printed before the grid itself — anything printed after the query but before
   // the grid draws would shift the viewport and invalidate it right away.
-  console.log(
-    `temu — streaming ${serial} (${String(geometry.width)}x${String(geometry.height)}). Ctrl+C to quit.\n`,
-  );
+  console.log(`temu — streaming ${target.label}. Ctrl+C to quit.\n`);
 
   // Falls back to assuming the top-left corner of the terminal if the terminal doesn't answer
   // in time — mouse targeting would be off, but nothing crashes.
@@ -483,7 +525,13 @@ export async function runStream(argv: string[]): Promise<number> {
   const gridOrigin: GridOrigin = cursorPosition ?? { row: 1, col: 1 };
 
   const { cols: startCols, rows: startRows } = currentAvailableCells(gridOrigin.row);
-  let fit = fitDeviceToCells(startCols, startRows, geometry.width, geometry.height, cellSize);
+  let fit = fitDeviceToCells(
+    startCols,
+    startRows,
+    target.capturePx.width,
+    target.capturePx.height,
+    cellSize,
+  );
 
   const renderer: FrameRenderer = useBlocks
     ? new BlocksRenderer({ cols: fit.cols, rows: fit.rows })
@@ -493,26 +541,30 @@ export async function runStream(argv: string[]): Promise<number> {
   });
   const statusBar = new StatusBar(gridOrigin.row + fit.rows, fit.cols);
 
-  // screenrecord emits essentially nothing while the display is asleep (see isDisplayOn's doc
-  // comment) — from here that's indistinguishable from a broken pipeline, so say so explicitly
-  // rather than leaving the pane looking stuck. Deliberately doesn't send KEYCODE_WAKEUP itself:
-  // temu shouldn't change device state on the user's behalf just for starting up.
+  // Android's screenrecord emits essentially nothing while the display is asleep (see
+  // src/device/discover.ts's isDisplayOn) — from here that's indistinguishable from a broken
+  // pipeline, so say so explicitly rather than leaving the pane looking stuck. Deliberately
+  // doesn't send a wake keyevent itself: temu shouldn't change device state on the user's behalf
+  // just for starting up. (Always true on iOS — see src/device/ios/target.ts's isDisplayOn.)
   if (!displayOn) {
     statusBar.showToast('device display is asleep — press p to wake', 8000);
   }
 
-  // Seed the pane with a real snapshot immediately. Same root cause as the staleness watchdog
-  // below: the first frame screenrecord captures on launch has nothing after it yet, so ffmpeg's
-  // Annex-B parser can't tell it's complete and won't emit it until a *second* frame's data
-  // starts arriving — which, if the screen is genuinely static from the moment temu starts,
-  // might not happen for an unbounded time. A one-shot screencap bypasses the whole H.264
-  // pipeline and shows the actual current screen right away; the live stream overwrites it as
+  // Seed the pane with a real snapshot immediately. On Android this is the same root cause as
+  // the staleness watchdog below: the first frame screenrecord captures on launch has nothing
+  // after it yet, so ffmpeg's Annex-B parser can't tell it's complete and won't emit it until a
+  // *second* frame's data starts arriving — which, if the screen is genuinely static from the
+  // moment temu starts, might not happen for an unbounded time. On iOS the bgra framebuffer
+  // stream is content-driven the same way (see BgraFramebufferSource) and can go just as long
+  // without a first frame on a static screen. A one-shot snapshot bypasses the live pipeline
+  // entirely and shows the actual current screen right away; the live stream overwrites it as
   // soon as it manages to produce its own first frame. Scaled to the exact size the live
-  // pipeline renders at — screencap's native resolution has a different aspect-ratio rounding
+  // pipeline renders at — a snapshot's native resolution has a different aspect-ratio rounding
   // than fitDeviceToCells' pane-pixel-perfect fit, and displaying it as-is showed up as a
   // visible squish/resize the moment the live stream's first (correctly-sized) frame replaced
   // it.
-  captureScreencapPng(serial)
+  target
+    .snapshotPng()
     .then((png) => scalePng(png, fit.capturePx.width, fit.capturePx.height))
     .then((png) => dropFrame(png))
     .catch(() => undefined);
@@ -545,18 +597,18 @@ export async function runStream(argv: string[]): Promise<number> {
 
   // Staleness watchdog: the live pipeline can go quiet indefinitely on a screen that changes
   // once and then holds still — e.g. a popup that appears and then just sits there. That last
-  // "settled" frame is exactly the kind ffmpeg's decoder tends to hold back (see the
-  // screencap-seeding note above for why): motion is what pushes buffered frames out, and a
+  // "settled" frame is exactly the kind the decoder tends to hold back (see the snapshot-seeding
+  // note above for why, on both platforms): motion is what pushes buffered frames out, and a
   // popup produces one change followed by no motion at all, so the pre-popup frame can simply
   // stay on screen forever with nothing to dislodge it. If no new live frame has arrived in
-  // STALE_FRAME_THRESHOLD_MS, take one corrective `screencap` — cheap, always accurate, and
-  // bypasses the H.264 pipeline entirely — so the view can't drift for longer than that. Only
+  // STALE_FRAME_THRESHOLD_MS, take one corrective snapshot — cheap, always accurate, and
+  // bypasses the live pipeline entirely — so the view can't drift for longer than that. Only
   // one correction per stillness period: onCaptureFrame clears the flag again as soon as the
   // live pipeline produces a genuinely new frame.
   let screencapInFlight = false;
   const refreshFromScreencapIfStale = (): void => {
     if (screencapInFlight || correctedThisStillPeriod || zoomRegion) {
-      // A screencap is a full, unzoomed frame — showing one while zoomed in would flash the
+      // A snapshot is a full, unzoomed frame — showing one while zoomed in would flash the
       // view back out to full-screen, which is worse than a brief stale frame.
       return;
     }
@@ -564,7 +616,8 @@ export async function runStream(argv: string[]): Promise<number> {
       return;
     }
     screencapInFlight = true;
-    captureScreencapPng(serial)
+    target
+      .snapshotPng()
       .then((png) => scalePng(png, fit.capturePx.width, fit.capturePx.height))
       .then((png) => {
         latestFrame = png;
@@ -596,20 +649,20 @@ export async function runStream(argv: string[]): Promise<number> {
   // Zoom restarts the whole pipeline at full native capture resolution with a crop, rather than
   // cropping the already-downscaled normal capture — see PipelineOptions' doc comment for why.
   let zoomRegion: ZoomRegion | null = null;
-  // ffmpeg decodes and PNG-encodes every frame screenrecord delivers regardless of the current
-  // display fps (adjustable live via +/- without a restart); the render tick (below) is what
-  // throttles what's actually rendered down to the newest frame per tick.
+  // ffmpeg decodes and PNG-encodes every frame the capture source delivers regardless of the
+  // current display fps (adjustable live via +/- without a restart); the render tick (below) is
+  // what throttles what's actually rendered down to the newest frame per tick.
   const buildPipelineOptions = (): PipelineOptions =>
     zoomRegion
       ? {
-          capturePx: { width: geometry.width, height: geometry.height },
+          capturePx: target.capturePx,
           outputPx: fit.capturePx,
-          crop: zoomRegion,
+          crop: zoomRegionToCapturePx(zoomRegion, target),
         }
       : { capturePx: fit.capturePx, outputPx: fit.capturePx };
 
   let pipeline = new Pipeline(
-    serial,
+    target,
     buildPipelineOptions(),
     options.bitrate,
     onCaptureFrame,
@@ -625,7 +678,13 @@ export async function runStream(argv: string[]): Promise<number> {
     }
     resizeTimer = setTimeout(() => {
       const { cols, rows } = currentAvailableCells(gridOrigin.row);
-      const nextFit = fitDeviceToCells(cols, rows, geometry.width, geometry.height, cellSize);
+      const nextFit = fitDeviceToCells(
+        cols,
+        rows,
+        target.capturePx.width,
+        target.capturePx.height,
+        cellSize,
+      );
       if (
         nextFit.cols === fit.cols &&
         nextFit.rows === fit.rows &&
@@ -639,7 +698,7 @@ export async function runStream(argv: string[]): Promise<number> {
       statusBar.resize(gridOrigin.row + fit.rows, fit.cols);
       pipeline.stop();
       pipeline = new Pipeline(
-        serial,
+        target,
         buildPipelineOptions(),
         options.bitrate,
         onCaptureFrame,
@@ -651,7 +710,7 @@ export async function runStream(argv: string[]): Promise<number> {
   };
   process.stdout.on('resize', handleResize);
 
-  const input = new AdbShellInputBackend(serial, (message) => console.error(message));
+  const input: InputBackend = target.createInput((message) => console.error(message));
 
   let exiting = false;
   const cleanup = (): void => {
@@ -689,11 +748,17 @@ export async function runStream(argv: string[]): Promise<number> {
   const onZoomRequested = (centerX: number, centerY: number): void => {
     zoomRegion = zoomRegion
       ? null
-      : computeZoomRegion(centerX, centerY, geometry.width, geometry.height, ZOOM_FACTOR);
+      : computeZoomRegion(
+          centerX,
+          centerY,
+          target.inputSize.width,
+          target.inputSize.height,
+          ZOOM_FACTOR,
+        );
     statusBar.showToast(zoomRegion ? `zoomed ${String(ZOOM_FACTOR)}x` : 'zoom off', 1500);
     pipeline.stop();
     pipeline = new Pipeline(
-      serial,
+      target,
       buildPipelineOptions(),
       options.bitrate,
       onCaptureFrame,
@@ -703,11 +768,10 @@ export async function runStream(argv: string[]): Promise<number> {
     );
   };
 
-  const mouseTracker = setUpMouse(input, gridOrigin, () => fit, geometry);
+  const mouseTracker = setUpMouse(input, gridOrigin, () => fit, target.inputSize);
   const { keyboard, getFpsCap, isHelpVisible, isHintActive } = setUpKeyboard(
     input,
-    serial,
-    geometry,
+    target,
     () => fit,
     gridOrigin,
     renderer,
