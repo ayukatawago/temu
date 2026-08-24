@@ -15,11 +15,15 @@ pane — so the device sits side by side with a CLI AI agent instead of in a sep
 ## Usage
 
 ```sh
-temu                          # attach to the only connected device and stream its screen
-temu --device <serial>        # attach to a specific device (adb serial)
-temu tmux [--device <serial>] # split the current tmux window and run temu in the new pane
-temu doctor [--fix]           # check adb/ffmpeg/tmux/terminal-graphics; --fix offers to turn
-                               # on tmux's allow-passthrough if it's off
+temu                            # attach to the only connected device and stream its screen
+temu --device <serial>          # attach to a specific device (adb serial)
+temu --bitrate <rate>           # screenrecord encode bitrate, e.g. 4M (default 8M)
+temu tmux [--device <serial>] [--percent <n>]
+                                 # split the current tmux window (new pane gets <n>% of its
+                                 # width, default 40) and run temu in the new pane
+temu doctor [--fix] [--no-render-test]
+                                 # check adb/ffmpeg/tmux/terminal-graphics; --fix offers to turn
+                                 # on tmux's allow-passthrough if it's off
 ```
 
 While streaming:
