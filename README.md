@@ -55,3 +55,7 @@ npm run format:check
 ```
 
 Commits in this repo follow Conventional Commits — see `.claude/skills/commit/SKILL.md`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
