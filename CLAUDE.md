@@ -130,8 +130,13 @@ iOS:     sim-use stream-video --format bgra -> PassThrough -> ffmpeg (decode+cro
   those (its format/size are declared up front via `-pixel_format`/`-video_size`, so there's
   nothing to probe for) but tolerates zero desync — a framebuffer resize (e.g. rotation) corrupts
   every subsequent frame with no way to resync short of rebuilding the pipeline; out of scope for
-  v1 (portrait-only). `scalePng` is a separate one-shot ffmpeg invocation used to rescale a
-  snapshot PNG to match the live pipeline's current output size.
+  v1 (portrait-only). The PNG encoder itself runs at `-compression_level 1`, not ffmpeg's default
+  6: measured at ~0.6-0.8s to encode a single full-resolution iOS frame (1206x2622) at the default
+  level — slower than any fps cap this codebase offers, so every frame queued up behind the
+  encoder rather than the capture source or render tick. Level 1 measured ~0.1-0.15s for the same
+  frame, for ~20% larger output — irrelevant since the PNG goes straight from a local temp file
+  into Kitty's `t=t` transmission, never over a network. `scalePng` is a separate one-shot ffmpeg
+  invocation used to rescale a snapshot PNG to match the live pipeline's current output size.
 - **Structural limitation to know before touching the Android path**: raw H.264 Annex-B has no
   end-of-access-unit marker, so ffmpeg's demuxer can only tell a frame is complete once it sees
   the _next_ NAL's start code, or EOF. On a live pipe, a genuinely final frame (screen changes
