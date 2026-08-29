@@ -21,10 +21,10 @@ import { PngFrameSplitter, scalePng } from './device/transcode.js';
 import type { InputBackend } from './input/backend.js';
 import { renderHintOverlay, type HintTarget } from './input/hints.js';
 import { KeyboardHandler, type KeyboardMode } from './input/keymap.js';
-import { MouseTracker } from './input/mouse.js';
+import { DISABLE_MOUSE_TRACKING, MouseTracker } from './input/mouse.js';
 import { BlocksRenderer } from './render/blocks.js';
 import { detectCaps, queryCursorPosition, type CellPixelSize } from './render/caps.js';
-import { renderHelpOverlay, StatusBar } from './render/chrome.js';
+import { enterAltScreen, leaveAltScreen, renderHelpOverlay, StatusBar } from './render/chrome.js';
 import {
   cellToDevicePixel,
   computeZoomRegion,
@@ -180,10 +180,18 @@ function frameDropper(renderer: FrameRenderer, onError: (error: unknown) => void
  * before that print, under the assumption that nothing would move the viewport afterward) and
  * breaking every mouse coordinate computed from it. Found via exactly that symptom: real clicks
  * at every row consistently mapped to the same near-zero device Y.
+ *
+ * `process.stdout.columns`/`.rows` can be `0` rather than `undefined` — confirmed on a bare pty
+ * with no winsize ever set (e.g. under `script`, or a raw `spawn` with no `stdio: 'inherit'`):
+ * Node reports `{columns: 0, rows: 0}` there, and `?? 80` doesn't catch a `0`. Every tmux pane
+ * always has a real winsize, which is why this only ever showed up outside tmux — left
+ * unguarded it collapses `fitDeviceToCells` to a 1x1 grid.
  */
 function currentAvailableCells(originRow: number): { cols: number; rows: number } {
-  const cols = process.stdout.columns ?? 80;
-  const totalRows = process.stdout.rows ?? 24;
+  const rawCols = process.stdout.columns;
+  const rawRows = process.stdout.rows;
+  const cols = rawCols && rawCols > 0 ? rawCols : 80;
+  const totalRows = rawRows && rawRows > 0 ? rawRows : 24;
   const rows = Math.max(1, totalRows - (originRow - 1) - STATUS_BAR_ROWS);
   return { cols, rows };
 }
@@ -504,13 +512,20 @@ export async function runStream(argv: string[]): Promise<number> {
   }
   const cellSize: CellPixelSize = caps.cellSize;
 
+  // Switches to the terminal's alternate screen buffer so quitting restores whatever was in the
+  // pane/window before temu started, instead of leaving the (now image-less) placeholder grid
+  // and status bar sitting there. Works the same inside tmux, which tracks the alternate screen
+  // per pane and restores the pane's own prior content on `leaveAltScreen` below.
+  enterAltScreen();
+
   // Clears the *screen* (not scrollback — prior output stays reachable by scrolling up) and
   // homes the cursor, so gridOrigin below always lands near row 1 regardless of how much was
   // already in the pane. Without this, a pane with a long scrollback of prior shell output
   // pushes the origin far down, which starves currentAvailableCells() of rows for no reason —
   // the grid doesn't need to coexist with old output, it just needs a predictable starting
   // point. Plain ANSI, not passthrough-wrapped: tmux understands clear-screen/cursor-home
-  // natively.
+  // natively. Also still needed on the alternate screen itself, which starts out as whatever was
+  // last drawn on it (typically blank, but not guaranteed).
   process.stdout.write('\x1b[2J\x1b[H');
 
   // Deliberately no cell-size/grid-dimensions mention here: those depend on knowing gridOrigin
@@ -735,7 +750,22 @@ export async function runStream(argv: string[]): Promise<number> {
     input.dispose();
     pipeline.stop();
     renderer.dispose();
+    // Last: the Kitty image-delete APC above still needs the placements to exist when it's sent,
+    // which requires still being on the same screen buffer they were drawn on.
+    leaveAltScreen();
   };
+
+  // Safety net for a crash or an unexpected process.exit that skips cleanup() entirely: leaving
+  // the terminal on the alternate screen with SGR mouse tracking still enabled would strand
+  // whatever shell/terminal the user returns to. process.stdout.write to a TTY is synchronous on
+  // POSIX, so this reliably lands even during an 'exit' handler, which cannot run async work.
+  process.once('exit', () => {
+    if (exiting) {
+      return;
+    }
+    process.stdout.write(DISABLE_MOUSE_TRACKING);
+    leaveAltScreen();
+  });
 
   let resolveRun: ((code: number) => void) | null = null;
   const quit = (): void => {

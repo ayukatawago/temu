@@ -1,5 +1,9 @@
-// `temu tmux`: splits the current tmux window and launches temu in the new pane, sized to leave
-// the agent's pane (this one) as the primary working area.
+// `temu split` (alias: `temu tmux`): splits the current tmux window and launches temu in the new
+// pane, sized to leave the agent's pane (this one) as the primary working area. This is the one
+// feature that's genuinely tmux-only — temu itself runs fine in any terminal (see CLAUDE.md and
+// src/render/caps.ts), but "split my current pane" only has a defined meaning with a multiplexer
+// backing it, and tmux is the only one this project can verify. Outside tmux this just tells the
+// user to open a second window/pane themselves and run `temu` there.
 //
 // Builds the new pane's command as a plain argv array (node binary, this script's own path, then
 // flags) rather than a shell-quoted string. Verified directly against a real tmux instance: both
@@ -13,7 +17,7 @@ import { execFile } from 'node:child_process';
 import type { Platform } from './device/target.js';
 import { isInsideTmux } from './render/caps.js';
 
-export interface TmuxLayoutOptions {
+export interface SplitOptions {
   device?: string | undefined;
   platform?: Platform | undefined;
   /** Width the new (video) pane takes, as a percentage of the current window. */
@@ -22,7 +26,7 @@ export interface TmuxLayoutOptions {
 
 const DEFAULT_PANE_PERCENT = 40;
 
-export function parseTmuxArgs(argv: string[]): TmuxLayoutOptions {
+export function parseSplitArgs(argv: string[]): SplitOptions {
   let device: string | undefined;
   let platform: Platform | undefined;
   let percent = DEFAULT_PANE_PERCENT;
@@ -52,13 +56,16 @@ function runTmux(args: string[]): Promise<{ ok: boolean; stderr: string }> {
   });
 }
 
-export async function runTmuxLayout(argv: string[]): Promise<number> {
+export async function runSplit(argv: string[]): Promise<number> {
   if (!isInsideTmux()) {
-    console.error('temu tmux must be run from inside a tmux session.');
+    console.error(
+      'temu split needs a multiplexer that can split panes; none detected. tmux is supported ' +
+        'today.\nJust run `temu` in a second terminal window/split instead.',
+    );
     return 1;
   }
 
-  const options = parseTmuxArgs(argv);
+  const options = parseSplitArgs(argv);
 
   // Re-invoke the exact same script via the exact same node binary that's running right now,
   // rather than relying on a `temu` command being resolvable on the new pane's PATH — the same

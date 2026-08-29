@@ -1,20 +1,26 @@
 #!/usr/bin/env node
 
 import { runDoctor } from './doctor.js';
+import { runSplit } from './split.js';
 import { runStream } from './stream.js';
-import { runTmuxLayout } from './tmuxlayout.js';
 
 function printUsage(): void {
-  console.log('temu — display and drive an Android emulator or iOS Simulator inside a tmux pane');
+  console.log('temu — display and drive an Android emulator or iOS Simulator in your terminal');
+  console.log('(tmux optional — only needed for `temu split`)');
   console.log('');
   console.log('Usage: temu [--device <serial|udid>] [--platform ios|android] [--bitrate <rate>]');
   console.log('       temu doctor [--fix] [--calibrate]');
-  console.log('       temu tmux [--device <serial|udid>] [--platform ios|android] [--percent <n>]');
+  console.log(
+    '       temu split [--device <serial|udid>] [--platform ios|android] [--percent <n>]',
+  );
   console.log('');
   console.log('Commands:');
   console.log('  (none)  Attach to a device/simulator and stream its screen into this pane');
-  console.log('  doctor  Check environment: adb, ffmpeg, tmux, terminal graphics, sim-use');
-  console.log('  tmux    Split the current tmux window and run temu in the new pane');
+  console.log(
+    '  doctor  Check environment: adb, ffmpeg, terminal graphics, tmux/sim-use (optional)',
+  );
+  console.log('  split   tmux only: split the current window and run temu in the new pane');
+  console.log('          (alias: tmux)');
   console.log('');
   console.log('--device without --platform auto-detects: a UUID-shaped value is treated as an iOS');
   console.log(
@@ -31,8 +37,9 @@ async function main(): Promise<void> {
       process.exitCode = await runDoctor(rest);
       break;
     }
+    case 'split':
     case 'tmux': {
-      process.exitCode = await runTmuxLayout(rest);
+      process.exitCode = await runSplit(rest);
       break;
     }
     case undefined: {

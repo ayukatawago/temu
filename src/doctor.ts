@@ -40,59 +40,75 @@ function printResult(result: CheckResult): void {
   console.log(`  ${icon(result.status)} ${result.label}: ${result.detail}`);
 }
 
-function runCommand(
-  command: string,
-  args: string[],
-): Promise<{ code: number | null; stdout: string; stderr: string }> {
+interface CommandResult {
+  /** Set when the binary itself couldn't be launched at all (e.g. `ENOENT` — not on PATH),
+   * as opposed to the command running and exiting with a nonzero code. Node's `execFile`
+   * surfaces both shapes through the same `error.code`, but a spawn failure's code is a string
+   * ('ENOENT', 'EACCES', ...) while a nonzero-exit failure's code is the numeric exit status —
+   * confirmed directly (`execFile('definitely-not-a-binary', ...)` yields `error.code === 'ENOENT'`
+   * with empty stdout/stderr). Only the spawn-failure case means "not installed". */
+  spawnError?: string;
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+function runCommand(command: string, args: string[]): Promise<CommandResult> {
   return new Promise((resolveP) => {
     execFile(command, args, { timeout: 5000 }, (error, stdout, stderr) => {
-      resolveP({ code: error ? (error.code as number | null) : 0, stdout, stderr });
+      if (error && typeof error.code === 'string') {
+        resolveP({ spawnError: error.code, code: null, stdout, stderr });
+        return;
+      }
+      resolveP({ code: error ? ((error.code as number | undefined) ?? null) : 0, stdout, stderr });
     });
   });
 }
 
 async function checkBinaryVersion(name: string, versionArgs: string[]): Promise<CheckResult> {
-  try {
-    const { stdout, stderr } = await runCommand(name, versionArgs);
-    const firstLine = (stdout || stderr).split('\n')[0]?.trim();
-    return {
-      label: name,
-      status: 'ok',
-      detail: firstLine && firstLine.length > 0 ? firstLine : 'present',
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { label: name, status: 'fail', detail: `not found on PATH (${message})` };
+  const result = await runCommand(name, versionArgs);
+  if (result.spawnError) {
+    return { label: name, status: 'fail', detail: `not found on PATH (${result.spawnError})` };
   }
+  const firstLine = (result.stdout || result.stderr).split('\n')[0]?.trim();
+  return {
+    label: name,
+    status: 'ok',
+    detail: firstLine && firstLine.length > 0 ? firstLine : 'present',
+  };
 }
 
 async function checkAdbDevices(): Promise<CheckResult> {
-  try {
-    const { stdout } = await runCommand('adb', ['devices', '-l']);
-    const lines = stdout
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-    const deviceLines = lines.slice(1); // first line is "List of devices attached"
-    if (deviceLines.length === 0) {
-      return { label: 'adb devices', status: 'warn', detail: 'no devices or emulators attached' };
-    }
-    const serials = deviceLines.map((line) => line.split(/\s+/)[0] ?? '?');
+  const result = await runCommand('adb', ['devices', '-l']);
+  if (result.spawnError) {
     return {
       label: 'adb devices',
-      status: 'ok',
-      detail: `${deviceLines.length} attached: ${serials.join(', ')}`,
+      status: 'fail',
+      detail: `could not list devices (${result.spawnError})`,
     };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { label: 'adb devices', status: 'fail', detail: `could not list devices (${message})` };
   }
+  const lines = result.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const deviceLines = lines.slice(1); // first line is "List of devices attached"
+  if (deviceLines.length === 0) {
+    return { label: 'adb devices', status: 'warn', detail: 'no devices or emulators attached' };
+  }
+  const serials = deviceLines.map((line) => line.split(/\s+/)[0] ?? '?');
+  return {
+    label: 'adb devices',
+    status: 'ok',
+    detail: `${deviceLines.length} attached: ${serials.join(', ')}`,
+  };
 }
 
 /**
- * Like checkBinaryVersion, but reports a missing binary as `warn` rather than `fail`. iOS
- * Simulator support (xcrun/sim-use) is optional — a machine with only Android tooling shouldn't
- * have `temu doctor` report "problems" over tooling it never needed.
+ * Like checkBinaryVersion, but reports a missing binary as `warn` rather than `fail`. Used for
+ * anything temu can run entirely without: iOS Simulator support (xcrun/sim-use) on a machine
+ * with only Android tooling, Android tooling (adb) on an iOS-only Mac, and tmux itself — temu
+ * runs fine in a plain terminal (see CLAUDE.md), tmux is only needed for `temu split` and for
+ * the `allow-passthrough` setting checked further down when temu happens to run inside one.
  */
 async function checkOptionalBinaryVersion(
   name: string,
@@ -159,7 +175,7 @@ function askYesNo(question: string, defaultYes: boolean): Promise<boolean> {
   });
 }
 
-async function runRenderTest(): Promise<boolean> {
+async function runRenderTest(insideTmux: boolean): Promise<boolean> {
   console.log('\nRendering a test pattern via Kitty graphics...');
   const cols = 24;
   const rows = 12;
@@ -172,9 +188,12 @@ async function runRenderTest(): Promise<boolean> {
     console.log('visible directly above this line.');
     const sawIt = await askYesNo('Did you see the test pattern correctly?', false);
     if (sawIt) {
-      console.log('  Now try switching panes and back, then resizing this pane — the image');
+      const survivalAction = insideTmux
+        ? 'switching panes and back, then resizing this pane'
+        : 'scrolling and back, then resizing this window';
+      console.log(`  Now try ${survivalAction} — the image`);
       console.log('  should survive both. This is the real test of the placeholder approach.');
-      const survived = await askYesNo('Did it survive pane-switch and resize?', false);
+      const survived = await askYesNo('Did it survive that?', false);
       return survived;
     }
     return false;
@@ -209,10 +228,16 @@ export async function runDoctor(argv: string[]): Promise<number> {
     }
   };
 
-  record(await checkBinaryVersion('adb', ['version']));
-  record(await checkAdbDevices());
-  record(await checkBinaryVersion('ffmpeg', ['-version']));
-  record(await checkBinaryVersion('tmux', ['-V']));
+  // adb is required for Android targets but entirely unused for iOS-only setups (mirrors
+  // checkSimUse's rationale below for the reverse case) — so its absence is a `warn`, and the
+  // adb-devices check is skipped outright rather than reporting a misleading "no devices".
+  const adb = await checkOptionalBinaryVersion('adb', ['version']);
+  record(adb);
+  if (adb.status === 'ok') {
+    record(await checkAdbDevices());
+  }
+  record(await checkBinaryVersion('ffmpeg', ['-version'])); // required by every platform's pipeline
+  record(await checkOptionalBinaryVersion('tmux', ['-V']));
 
   // iOS Simulator support only exists on macOS, and is optional even there — none of these
   // affect Android, so nothing here sets hadFailure.
@@ -242,7 +267,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
     status: insideTmux ? 'ok' : 'info',
     detail: insideTmux
       ? 'running inside tmux'
-      : 'not running inside tmux — passthrough wrapping is skipped entirely',
+      : 'not running inside tmux — temu runs fine here; passthrough wrapping is skipped entirely',
   });
 
   let passthrough: PassthroughState = 'unknown';
@@ -319,7 +344,7 @@ export async function runDoctor(argv: string[]): Promise<number> {
     (!insideTmux || passthrough === 'on');
 
   if (canRenderTest) {
-    const passed = await runRenderTest();
+    const passed = await runRenderTest(insideTmux);
     record({
       label: 'render test',
       status: passed ? 'ok' : 'fail',

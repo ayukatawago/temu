@@ -31,6 +31,18 @@ function moveTo(row: number, col: number): string {
   return `\x1b[${String(row)};${String(col)}H`;
 }
 
+// Deliberately not passthrough-wrapped, same reasoning as the rest of this file: DECSET 1049 is
+// exactly the kind of screen-buffer-management sequence tmux itself needs to see and act on (it
+// tracks the alternate screen per pane and restores the pane's own prior content on exit), not
+// something to hide from it inside a passthrough envelope.
+export function enterAltScreen(): void {
+  process.stdout.write('\x1b[?1049h');
+}
+
+export function leaveAltScreen(): void {
+  process.stdout.write('\x1b[?1049l');
+}
+
 function padTruncate(text: string, width: number): string {
   if (width <= 0) return '';
   if (text.length >= width) return text.slice(0, width);
