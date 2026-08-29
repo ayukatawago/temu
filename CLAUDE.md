@@ -170,7 +170,25 @@ iOS:     sim-use stream-video --format bgra -> PassThrough -> ffmpeg (decode+cro
   `.rows` of exactly `0` — not just `undefined` — as "unknown, use the fallback": confirmed on a
   bare pty with no winsize ever set (`process.stdout` reports `{columns: 0, rows: 0}` there, which
   `?? 80` doesn't catch), collapsing the grid to 1x1. Every tmux pane always has a real winsize,
-  which is why this only ever surfaces outside tmux.
+  which is why this only ever surfaces outside tmux. Handles `SIGHUP` alongside `SIGINT`/
+  `SIGTERM`: tmux sends it (not the other two) when a pane closes out from under its process —
+  `tmux kill-pane`, or the pane's window disappearing — and without it, `cleanup()` never runs at
+  all, leaking the Kitty image (`src/render/kitty.ts`'s `dispose()` never gets called). Also
+  installs a no-op `process.stdout.on('error', ...)`: once the pane's pty is gone, tmux has
+  already destroyed it by the time `cleanup()` runs, so its very _first_ write (disabling mouse
+  tracking) throws `EIO` — reproduced directly by `kill-pane`-ing a live instance and watching
+  the unhandled `'error'` event on the stream crash the process right there, before it ever
+  reaches `renderer.dispose()`'s image-delete command or `leaveAltScreen()`. Swallowing that
+  error doesn't recover the write (a dead pty can't be written to, full stop), it just stops one
+  failed write from aborting the rest of cleanup.
+
+  `--renderer kitty|blocks` overrides `detectCaps()`'s Kitty-support autodetection outright, in
+  either direction — a general-purpose manual escape hatch for whatever autodetection can't
+  observe directly, not a workaround for one specific known bug. It was originally added while
+  chasing a `temu split` video-in-the-wrong-pane report that looked like a Kitty-compositing
+  limitation in the host terminal; that turned out to be temu's own bug (a placeholder grid
+  wrongly sent through tmux passthrough — see `src/render/kitty.ts`'s `drawPlaceholderGrid` doc
+  comment) and is fixed there directly, not worked around here.
 
 ### Rendering
 
@@ -180,7 +198,20 @@ iOS:     sim-use stream-video --format bgra -> PassThrough -> ffmpeg (decode+cro
   as ordinary text, so tmux's screen model can scroll/reflow/redraw it without knowing anything
   about images. Each frame is written to a temp PNG file and referenced via `t=t` transmission
   (not `t=d` base64-inline) specifically to keep tmux's control-socket traffic tiny. Requires
-  tmux's `allow-passthrough` to be on when running inside tmux (`temu doctor --fix` sets it).
+  tmux's `allow-passthrough` to be on when running inside tmux (`temu doctor --fix` sets it). The
+  image id defaults to a value derived from `process.pid`, not a fixed constant: the protocol's
+  image-id namespace is shared by the whole real terminal, not scoped per pane, so two temu
+  instances both defaulting to id 1 (e.g. one running directly, one opened via `temu split`)
+  would repaint each other's placeholder grids — confirmed as the exact cause of a reported bug
+  where a `split`-created pane's video appeared on the _original_ pane instead. Every placeholder
+  grid draw is followed by a `tmux refresh-client` (`requestTmuxRedraw` in caps.ts, a no-op
+  outside tmux): tmux 3.7b drops a cell's combining diacritics on the way to the terminal whenever
+  the pane's `xoff` is non-zero (the right-hand pane `temu split` creates), because
+  `screen_write_combine()` checks the modified cell's visibility using a pane-relative x where the
+  rest of that file uses `wp->xoff + cx` — so the re-emit is skipped as "obscured". Bare
+  placeholders make every row render as image row 0, which is the reported "top strip of the phone
+  screen tiled down the pane". tmux's own grid keeps the diacritics, so one full repaint fixes it;
+  fixed upstream after 3.7b, hence a workaround rather than a version bump.
 - `src/render/blocks.ts` — fallback renderer for terminals without Kitty graphics support: draws
   frames as colored upper-half-block characters (2 vertical "pixels" per cell via independent
   fg/bg SGR colors). Implements the same `renderFramePng`/`resize`/`dispose` shape as
@@ -189,6 +220,14 @@ iOS:     sim-use stream-video --format bgra -> PassThrough -> ffmpeg (decode+cro
   cell pixel size, Kitty graphics support) lives here, via live escape-sequence queries with a
   heuristic (env-var-based) fallback when queries aren't possible (non-interactive, or tmux would
   swallow them). Nothing else in the codebase should be probing terminal capabilities directly.
+  Cell pixel size and Kitty graphics support are properties of the _real_ terminal, so their
+  queries go through tmux passthrough to reach it — but `queryCursorPosition` deliberately
+  doesn't (`passthrough: false`): tmux answers `CSI 6n` itself, in coordinates relative to the
+  _pane_, matching the space SGR mouse reports already arrive in. Passthrough-wrapping it instead
+  gets the real terminal's own absolute on-screen answer, which only coincides with pane-relative
+  in an unsplit pane — confirmed as the cause of every tap landing on the device's left edge in a
+  `temu split` pane (`gridOrigin.col` measured as the pane's absolute screen column instead of
+  ~1, driving `cellToDevicePixel`'s `mouseCol - origin.col` deeply negative before it clamps).
 - `src/render/geometry.ts` — pure math: fitting the device's native aspect ratio into the pane's
   available cell grid (`fitDeviceToCells`, also picks the capture resolution to request), and
   converting between terminal cell coordinates and "device pixel" coordinates in both directions,
@@ -253,10 +292,15 @@ iOS:     sim-use stream-video --format bgra -> PassThrough -> ffmpeg (decode+cro
 - `src/split.ts` — `temu split` (alias: `temu tmux`): splits the current tmux window and re-execs
   the same node binary/script in the new pane with the same argv shape (not a shell string — the
   target pane's shell may not be POSIX sh, so args are passed as an argv array to avoid quoting
-  bugs). Forwards `--device`/`--platform` through to the new pane's invocation. This is the one
-  feature that's genuinely tmux-only (see "What this is" above) — outside tmux it prints a message
-  telling the user to open a second window/pane themselves, rather than erroring as if tmux were
-  required for temu in general.
+  bugs). Forwards every non-`--percent` flag through to the new pane's invocation verbatim
+  (`--device`, `--platform`, `--renderer`, `--bitrate`, ...) rather than re-listing recognized
+  ones here — this file used to hardcode just `--device`/`--platform` and silently drop
+  everything else, which meant `--renderer` (see `stream.ts`'s entry below) had no effect when
+  combined with `split`; forwarding generically is what actually closes that off for any current
+  or future stream-only flag, mirroring `cli.ts`'s own "runStream's parser is the single source
+  of truth" dispatch philosophy. This is the one feature that's genuinely tmux-only (see "What
+  this is" above) — outside tmux it prints a message telling the user to open a second
+  window/pane themselves, rather than erroring as if tmux were required for temu in general.
 
 ## Conventions worth knowing
 

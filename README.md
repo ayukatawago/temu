@@ -27,11 +27,17 @@ temu --device <serial>          # attach to a specific Android device (adb seria
 temu --device <udid>            # attach to a specific iOS Simulator (auto-detected by UUID shape)
 temu --platform ios             # disambiguate platform without naming a specific device/udid
 temu --bitrate <rate>           # screenrecord encode bitrate, e.g. 4M (default 8M; Android only)
-temu split [--device <id>] [--platform ios|android] [--percent <n>]
+temu --renderer kitty|blocks    # override Kitty-graphics autodetection in either direction —
+                                 # try `blocks` if `temu split`'s video shows up in the wrong
+                                 # pane (seen with terminal-embedding tools whose Kitty support
+                                 # doesn't handle a pane that isn't at column 0)
+temu split [--percent <n>] [any other temu flag, e.g. --device/--renderer/--bitrate]
                                  # tmux only: split the current tmux window (new pane gets <n>%
-                                 # of its width, default 40) and run temu in the new pane
-                                 # (alias: temu tmux). Outside tmux, just open a second window
-                                 # or pane yourself and run temu there.
+                                 # of its width, default 40) and run temu in the new pane, with
+                                 # every flag other than --percent forwarded through unchanged —
+                                 # e.g. `temu split --renderer blocks` (alias: temu tmux).
+                                 # Outside tmux, just open a second window or pane yourself and
+                                 # run temu there.
 temu doctor [--fix] [--no-render-test]
                                  # check adb/ffmpeg/terminal-graphics, plus tmux/sim-use if
                                  # present; --fix offers to turn on tmux's allow-passthrough if
