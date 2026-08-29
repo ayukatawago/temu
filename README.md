@@ -1,7 +1,8 @@
 # temu
 
-Display and drive an Android emulator or a booted iOS Simulator as live pixels inside a tmux
-pane — so the device sits side by side with a CLI AI agent instead of in a separate GUI window.
+Display and drive an Android emulator or a booted iOS Simulator as live pixels inside your
+terminal — so the device sits side by side with a CLI AI agent instead of in a separate GUI
+window. Works in any terminal; tmux is entirely optional (see below).
 
 ## Requirements
 
@@ -11,7 +12,9 @@ pane — so the device sits side by side with a CLI AI agent instead of in a sep
   zero-dependency path (`xcrun simctl` alone can capture a screenshot but has no input verb of
   any kind). Not needed at all if you only ever attach to Android devices.
 - `ffmpeg` on `PATH`
-- tmux, if run inside it (temu works outside tmux too)
+- tmux is optional — temu renders and takes input the same way in a plain terminal window. It's
+  only needed for `temu split` (splitting your current pane), and, if you do run temu inside
+  tmux, for its `allow-passthrough` setting (see `temu doctor --fix`).
 - Ideally a terminal with Kitty graphics protocol support (virtual placements), for real pixels.
   Terminals without it get an automatic fallback to a lower-quality block-character renderer, so
   temu always displays something — run `temu doctor` to see which path you're on.
@@ -24,13 +27,19 @@ temu --device <serial>          # attach to a specific Android device (adb seria
 temu --device <udid>            # attach to a specific iOS Simulator (auto-detected by UUID shape)
 temu --platform ios             # disambiguate platform without naming a specific device/udid
 temu --bitrate <rate>           # screenrecord encode bitrate, e.g. 4M (default 8M; Android only)
-temu tmux [--device <id>] [--platform ios|android] [--percent <n>]
-                                 # split the current tmux window (new pane gets <n>% of its
-                                 # width, default 40) and run temu in the new pane
+temu split [--device <id>] [--platform ios|android] [--percent <n>]
+                                 # tmux only: split the current tmux window (new pane gets <n>%
+                                 # of its width, default 40) and run temu in the new pane
+                                 # (alias: temu tmux). Outside tmux, just open a second window
+                                 # or pane yourself and run temu there.
 temu doctor [--fix] [--no-render-test]
-                                 # check adb/ffmpeg/tmux/terminal-graphics/sim-use; --fix offers
-                                 # to turn on tmux's allow-passthrough if it's off
+                                 # check adb/ffmpeg/terminal-graphics, plus tmux/sim-use if
+                                 # present; --fix offers to turn on tmux's allow-passthrough if
+                                 # it's off
 ```
+
+`q` / `Ctrl+C` restores whatever was on screen before temu started — it runs on the terminal's
+alternate screen buffer, both inside and outside tmux.
 
 With no `--device`, temu attaches to the sole device/simulator visible across both platforms —
 an ambiguous or empty result errors out listing what it found (or didn't).

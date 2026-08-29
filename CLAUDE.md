@@ -5,11 +5,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 temu displays and drives an Android emulator/device or a booted iOS Simulator as live pixels
-inside a terminal (typically a tmux pane), so the device sits next to a CLI AI agent instead of
-in a separate GUI window. No Electron, no GUI toolkit — just `adb`/`sim-use` + `ffmpeg` + raw
-terminal escape sequences. There are no tests in this repo; correctness is established by reading
-the code's own doc comments (many encode specific measurements/verifications against a real
-emulator or simulator) and by manual runs against a live device.
+inside a terminal, so the device sits next to a CLI AI agent instead of in a separate GUI window.
+tmux is one host among others, not a requirement — the render/input path degrades correctly
+without it (see `src/render/caps.ts`'s `wrapTmuxPassthrough`, a no-op when `$TMUX` is unset), and
+`temu` runs the same way in a plain terminal window. The one genuinely tmux-only feature is
+`temu split` (`src/split.ts`), which needs an actual multiplexer to split a pane; everything else
+in this doc that mentions tmux is describing behavior that also has to work without it. No
+Electron, no GUI toolkit — just `adb`/`sim-use` + `ffmpeg` + raw terminal escape sequences. There
+are no tests in this repo; correctness is established by reading the code's own doc comments
+(many encode specific measurements/verifications against a real emulator or simulator) and by
+manual runs against a live device.
 
 Android is the zero-extra-dependency path (`adb` + `ffmpeg` only). iOS requires `sim-use` on
 PATH: it's the only way to reach a simulator's private framebuffer/HID APIs (`xcrun simctl` alone
@@ -42,7 +47,7 @@ node dist/cli.js                          # or: npm run dev
 node dist/cli.js --device <serial> --bitrate 4M   # Android
 node dist/cli.js --device <udid>                  # iOS Simulator (auto-detected by UUID shape)
 node dist/cli.js --platform ios                   # disambiguate without naming a device/udid
-node dist/cli.js tmux --percent 40
+node dist/cli.js split --percent 40       # tmux only (alias: `node dist/cli.js tmux ...`)
 node dist/cli.js doctor [--fix] [--no-render-test]
 adb devices                               # confirm a target Android device/emulator is attached
 xcrun simctl list devices booted          # confirm a target iOS Simulator is booted
@@ -157,7 +162,15 @@ iOS:     sim-use stream-video --format bgra -> PassThrough -> ffmpeg (decode+cro
   frame stuck by either platform's own capture limitation. Also wires up the keyboard/mouse
   handlers, the crosshair, hint mode, zoom, and the asleep-display toast (`isDisplayOn` — always
   `true` on iOS, since a locked simulator still renders a lock screen rather than going dark the
-  way a sleeping Android display does).
+  way a sleeping Android display does). Runs on the alternate screen buffer
+  (`enterAltScreen`/`leaveAltScreen` from `src/render/chrome.ts`) so quitting restores whatever
+  was on screen before temu started, on both tmux and plain terminals; a `process.once('exit', ...)`
+  safety net disables mouse tracking and leaves the alt screen even if `cleanup()` never runs
+  (crash, unexpected `process.exit`). `currentAvailableCells` treats `process.stdout.columns`/
+  `.rows` of exactly `0` — not just `undefined` — as "unknown, use the fallback": confirmed on a
+  bare pty with no winsize ever set (`process.stdout` reports `{columns: 0, rows: 0}` there, which
+  `?? 80` doesn't catch), collapsing the grid to 1x1. Every tmux pane always has a real winsize,
+  which is why this only ever surfaces outside tmux.
 
 ### Rendering
 
@@ -187,9 +200,11 @@ iOS:     sim-use stream-video --format bgra -> PassThrough -> ffmpeg (decode+cro
   dependency). The encoder exists for `doctor`'s self-test pattern; the decoder exists only to
   back the block-renderer fallback, which needs raw pixels rather than an opaque PNG buffer.
 - `src/render/chrome.ts` — the status bar (mode/crosshair/fps/toast, one line, always redrawn in
-  place via save/restore cursor) and the key-binding help overlay (`?`). Deliberately plain
-  ANSI/text, not passthrough-wrapped, since tmux needs to understand cursor movement natively —
-  the opposite of Kitty's APC codes, which tmux doesn't understand at all.
+  place via save/restore cursor), the key-binding help overlay (`?`), and `enterAltScreen`/
+  `leaveAltScreen` (DECSET 1049). All deliberately plain ANSI/text, not passthrough-wrapped, since
+  tmux needs to understand cursor movement and screen-buffer switches natively (it tracks the
+  alternate screen per pane and restores the pane's own prior content) — the opposite of Kitty's
+  APC codes, which tmux doesn't understand at all.
 
 ### Input
 
@@ -221,21 +236,27 @@ iOS:     sim-use stream-video --format bgra -> PassThrough -> ffmpeg (decode+cro
 
 ### Entry points
 
-- `src/cli.ts` — argv dispatch only (`temu`, `temu doctor`, `temu tmux`); no logic of its own.
-  Any other leading `--flag` (not just a fixed `--device`/`--bitrate` allowlist) routes to the
-  default streaming command — `src/stream.ts`'s own arg parser is the single source of truth for
-  which flags exist.
+- `src/cli.ts` — argv dispatch only (`temu`, `temu doctor`, `temu split`/`temu tmux`); no logic of
+  its own. Any other leading `--flag` (not just a fixed `--device`/`--bitrate` allowlist) routes
+  to the default streaming command — `src/stream.ts`'s own arg parser is the single source of
+  truth for which flags exist.
 - `src/stream.ts` — default command (streaming/interactive session).
-- `src/doctor.ts` — environment/capability checks (adb/ffmpeg/tmux presence, tmux
-  allow-passthrough, terminal cell size, Kitty graphics support, and on macOS: xcrun/sim-use
-  presence plus booted simulators) plus an interactive render self-test; `--fix` offers to turn
-  on tmux's `allow-passthrough`. iOS checks are all `warn`, never `fail` — iOS support is
-  optional and a missing `sim-use` shouldn't make an Android-only machine's doctor run look
-  broken.
-- `src/tmuxlayout.ts` — `temu tmux`: splits the current tmux window and re-execs the same
-  node binary/script in the new pane with the same argv shape (not a shell string — the target
-  pane's shell may not be POSIX sh, so args are passed as an argv array to avoid quoting bugs).
-  Forwards `--device`/`--platform` through to the new pane's invocation.
+- `src/doctor.ts` — environment/capability checks (adb/ffmpeg presence — required; tmux/sim-use
+  presence — optional, `warn` not `fail` on a machine that doesn't need them; tmux
+  allow-passthrough when applicable; terminal cell size; Kitty graphics support; and on macOS:
+  xcrun/sim-use presence plus booted simulators) plus an interactive render self-test; `--fix`
+  offers to turn on tmux's `allow-passthrough`. `runCommand`'s spawn-failure detection (an
+  `ENOENT`-style `error.code` is a string; a nonzero-exit failure's `error.code` is a number) is
+  what makes "not found on PATH" actually distinguishable from "ran fine" — confirmed directly
+  against a nonexistent binary — so don't go back to resolving on every `execFile` callback
+  regardless of error the way this used to.
+- `src/split.ts` — `temu split` (alias: `temu tmux`): splits the current tmux window and re-execs
+  the same node binary/script in the new pane with the same argv shape (not a shell string — the
+  target pane's shell may not be POSIX sh, so args are passed as an argv array to avoid quoting
+  bugs). Forwards `--device`/`--platform` through to the new pane's invocation. This is the one
+  feature that's genuinely tmux-only (see "What this is" above) — outside tmux it prints a message
+  telling the user to open a second window/pane themselves, rather than erroring as if tmux were
+  required for temu in general.
 
 ## Conventions worth knowing
 
