@@ -9,6 +9,7 @@ function printUsage(): void {
   console.log('(tmux optional — only needed for `temu split`)');
   console.log('');
   console.log('Usage: temu [--device <serial|udid>] [--platform ios|android] [--bitrate <rate>]');
+  console.log('            [--renderer kitty|blocks]');
   console.log('       temu doctor [--fix] [--calibrate]');
   console.log(
     '       temu split [--device <serial|udid>] [--platform ios|android] [--percent <n>]',
@@ -27,6 +28,15 @@ function printUsage(): void {
     'Simulator UDID, anything else as an adb serial. With neither flag, temu attaches to the',
   );
   console.log('sole available device/simulator across both platforms.');
+  console.log('');
+  console.log('--renderer overrides autodetection of Kitty graphics support in both directions.');
+  console.log(
+    "Force `blocks` if Kitty graphics is (mis)detected as supported but doesn't actually render",
+  );
+  console.log(
+    'correctly for you — seen on at least one terminal-embedding tool, specifically for a',
+  );
+  console.log("`temu split` pane that isn't at the terminal's column 0.");
 }
 
 async function main(): Promise<void> {

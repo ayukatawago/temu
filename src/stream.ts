@@ -35,16 +35,22 @@ import {
 } from './render/geometry.js';
 import { KittyRenderer } from './render/kitty.js';
 
+export type RendererChoice = 'kitty' | 'blocks';
+
 export interface StreamOptions {
   device?: string | undefined;
   platform?: Platform | undefined;
   bitrate: string;
+  /** Explicit override for detectCaps()'s Kitty-support autodetection — see --renderer's help
+   * text in cli.ts for why this needs to exist as a manual escape hatch. */
+  renderer?: RendererChoice | undefined;
 }
 
 export function parseStreamArgs(argv: string[]): StreamOptions {
   let device: string | undefined;
   let platform: Platform | undefined;
   let bitrate = '8M';
+  let renderer: RendererChoice | undefined;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--device') {
@@ -56,9 +62,14 @@ export function parseStreamArgs(argv: string[]): StreamOptions {
       }
     } else if (arg === '--bitrate') {
       bitrate = argv[++i] ?? bitrate;
+    } else if (arg === '--renderer') {
+      const value = argv[++i];
+      if (value === 'kitty' || value === 'blocks') {
+        renderer = value;
+      }
     }
   }
-  return { device, platform, bitrate };
+  return { device, platform, bitrate, renderer };
 }
 
 const STATUS_BAR_ROWS = 1;
@@ -507,12 +518,23 @@ export async function runStream(argv: string[]): Promise<number> {
   const [caps, displayOn] = await Promise.all([detectCaps(), target.isDisplayOn()]);
   // 'unknown' (heuristic couldn't tell) is treated optimistically — try Kitty graphics anyway.
   // Only a confirmed 'false' falls back, since the fallback is a real quality trade-off.
-  const useBlocks = caps.kittyGraphicsSupported === false;
+  //
+  // `--renderer` overrides autodetection outright, in both directions — a manual escape hatch
+  // for whatever detectCaps() can't observe directly (e.g. a terminal that answers the Kitty
+  // graphics query but has some other rendering quirk). It's a general-purpose override, not a
+  // workaround for a specific known bug: the split-pane misrendering this was originally added
+  // to work around (video landing outside the pane) turned out to be temu's own bug — see
+  // src/render/kitty.ts's `drawPlaceholderGrid` doc comment — and is fixed there directly.
+  const useBlocks = options.renderer
+    ? options.renderer === 'blocks'
+    : caps.kittyGraphicsSupported === false;
   if (useBlocks) {
-    console.error(
-      'Kitty graphics not detected — falling back to a lower-quality block-character ' +
-        'renderer. Run `temu doctor` for details.',
-    );
+    if (!options.renderer) {
+      console.error(
+        'Kitty graphics not detected — falling back to a lower-quality block-character ' +
+          'renderer. Run `temu doctor` for details.',
+      );
+    }
   } else if (caps.insideTmux && caps.tmuxAllowPassthrough !== 'on') {
     // Only relevant to the Kitty path: the block renderer is plain text/SGR, which tmux
     // understands natively and needs no passthrough at all.
