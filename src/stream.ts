@@ -484,6 +484,15 @@ export async function runStream(argv: string[]): Promise<number> {
     return 1;
   }
 
+  // A write to stdout after the underlying pty is gone (e.g. `tmux kill-pane` tears it down
+  // immediately on SIGHUP, before cleanup() gets a chance to run) throws EIO asynchronously as
+  // an unhandled 'error' event on the stream, which crashes the process right there — reproduced
+  // directly by kill-paning a live temu instance and watching cleanup() die on its very first
+  // write (mouseTracker.disable()) before ever reaching renderer.dispose()'s Kitty image-delete
+  // command or leaveAltScreen(). A dead pty can't be written to no matter what, so there's
+  // nothing to recover; the fix is just to not let that crash skip the rest of cleanup().
+  process.stdout.on('error', () => undefined);
+
   let target: DeviceTarget;
   try {
     target = await resolveTarget(options.device, options.platform);
@@ -774,6 +783,17 @@ export async function runStream(argv: string[]): Promise<number> {
   };
   process.once('SIGINT', quit);
   process.once('SIGTERM', quit);
+  // tmux sends SIGHUP (not SIGINT/SIGTERM) to a pane's process when the pane closes out from
+  // under it — `tmux kill-pane`, closing the pane via its own window-manager-style controls, or
+  // the pane's window disappearing. Without a handler, that skips cleanup() entirely: the Kitty
+  // image is never deleted (`a=d`) and the pane may never leave the alternate screen. Since the
+  // Kitty graphics protocol's image store lives on the real terminal somewhat independently of
+  // tmux's own per-pane text model (see src/render/kitty.ts's DEFAULT_IMAGE_ID comment), an
+  // image that's never explicitly deleted can resurface later wherever the terminal happens to
+  // redraw the same placeholder text again (e.g. after further pane churn reshuffles the
+  // layout) — reproduced by repeatedly `tmux kill-pane`-ing temu instances while diagnosing a
+  // report of video appearing in the wrong pane after `temu split`.
+  process.once('SIGHUP', quit);
 
   const onZoomRequested = (centerX: number, centerY: number): void => {
     zoomRegion = zoomRegion
