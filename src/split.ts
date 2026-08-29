@@ -14,38 +14,44 @@
 // passing on some machines but not others.
 
 import { execFile } from 'node:child_process';
-import type { Platform } from './device/target.js';
 import { isInsideTmux } from './render/caps.js';
 
 export interface SplitOptions {
-  device?: string | undefined;
-  platform?: Platform | undefined;
   /** Width the new (video) pane takes, as a percentage of the current window. */
   percent: number;
+  /**
+   * Everything else (`--device`, `--platform`, `--renderer`, `--bitrate`, ...), forwarded
+   * verbatim to the new pane's temu invocation — stream.ts's own arg parser is the single
+   * source of truth for which of these are valid, same design as cli.ts's default-command
+   * dispatch. This file used to re-list only `--device`/`--platform` explicitly and silently
+   * drop everything else, which meant `--renderer` (a real workaround for a terminal
+   * compatibility bug specific to split panes — see CLAUDE.md) had no effect when combined with
+   * `split`. Forwarding generically, rather than maintaining a duplicate allowlist here that has
+   * to be kept in sync with parseStreamArgs, is what actually fixes that class of bug for good.
+   */
+  forwardedArgs: string[];
 }
 
 const DEFAULT_PANE_PERCENT = 40;
 
 export function parseSplitArgs(argv: string[]): SplitOptions {
-  let device: string | undefined;
-  let platform: Platform | undefined;
   let percent = DEFAULT_PANE_PERCENT;
+  const forwardedArgs: string[] = [];
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--device') {
-      device = argv[++i];
-    } else if (argv[i] === '--platform') {
-      const value = argv[++i];
-      if (value === 'ios' || value === 'android') {
-        platform = value;
-      }
-    } else if (argv[i] === '--percent') {
+    const arg = argv[i];
+    if (arg === undefined) {
+      continue;
+    }
+    if (arg === '--percent') {
       const value = Number(argv[++i]);
       if (Number.isFinite(value) && value > 0 && value < 100) {
         percent = value;
       }
+      continue; // split-only flag — not meaningful to runStream, so not forwarded
     }
+    forwardedArgs.push(arg);
   }
-  return { device, platform, percent };
+  return { percent, forwardedArgs };
 }
 
 function runTmux(args: string[]): Promise<{ ok: boolean; stderr: string }> {
@@ -78,13 +84,8 @@ export async function runSplit(argv: string[]): Promise<number> {
     String(options.percent),
     process.execPath,
     process.argv[1] ?? 'temu',
+    ...options.forwardedArgs,
   ];
-  if (options.device) {
-    args.push('--device', options.device);
-  }
-  if (options.platform) {
-    args.push('--platform', options.platform);
-  }
 
   const result = await runTmux(args);
   if (!result.ok) {
