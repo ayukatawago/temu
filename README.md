@@ -27,10 +27,13 @@ temu --device <serial>          # attach to a specific Android device (adb seria
 temu --device <udid>            # attach to a specific iOS Simulator (auto-detected by UUID shape)
 temu --platform ios             # disambiguate platform without naming a specific device/udid
 temu --bitrate <rate>           # screenrecord encode bitrate, e.g. 4M (default 8M; Android only)
-temu --renderer kitty|blocks    # override Kitty-graphics autodetection in either direction —
-                                 # try `blocks` if `temu split`'s video shows up in the wrong
-                                 # pane (seen with terminal-embedding tools whose Kitty support
-                                 # doesn't handle a pane that isn't at column 0)
+temu --renderer kitty|blocks    # manually override which renderer to use, instead of the
+                                 # automatic choice: `kitty` shows real pixels via the Kitty
+                                 # graphics protocol (the default when supported); `blocks` is
+                                 # the lower-quality plain-text fallback. Only useful for
+                                 # troubleshooting — e.g. `blocks` if video ever looks wrong and
+                                 # you want a reliable fallback, or `kitty` to force it despite
+                                 # a negative autodetection result
 temu split [--percent <n>] [any other temu flag, e.g. --device/--renderer/--bitrate]
                                  # tmux only: split the current tmux window (new pane gets <n>%
                                  # of its width, default 40) and run temu in the new pane, with

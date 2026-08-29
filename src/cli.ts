@@ -29,14 +29,16 @@ function printUsage(): void {
   );
   console.log('sole available device/simulator across both platforms.');
   console.log('');
-  console.log('--renderer overrides autodetection of Kitty graphics support in both directions.');
   console.log(
-    "Force `blocks` if Kitty graphics is (mis)detected as supported but doesn't actually render",
+    '--renderer manually picks which renderer to use instead of the automatic choice: `kitty`',
   );
   console.log(
-    'correctly for you — seen on at least one terminal-embedding tool, specifically for a',
+    'shows real pixels via the Kitty graphics protocol (the default when supported); `blocks` is',
   );
-  console.log("`temu split` pane that isn't at the terminal's column 0.");
+  console.log(
+    'the lower-quality plain-text fallback. Only useful for troubleshooting — try `blocks` if',
+  );
+  console.log('video ever looks wrong, or `kitty` to force it despite a negative autodetection.');
 }
 
 async function main(): Promise<void> {
