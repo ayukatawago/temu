@@ -86,11 +86,58 @@ export async function setTmuxAllowPassthroughOn(): Promise<boolean> {
   return output !== null;
 }
 
+/**
+ * Asks tmux to repaint the attached client from its own grid, discarding whatever it believes the
+ * real terminal is currently showing. No-op outside tmux, and deliberately fire-and-forget — a
+ * failed repaint is a cosmetic problem, not something any caller can act on.
+ *
+ * Exists for exactly one reason: tmux 3.7-era versions never send a cell's *combining characters*
+ * to the terminal when the pane's horizontal offset is non-zero (the right-hand pane of a
+ * left/right split — i.e. the one `temu split` creates). `screen_write_combine()` in tmux 3.7b
+ * appends the combining character to its grid, then checks whether the cell it just modified is
+ * on screen before re-emitting it, and passes a *pane-relative* x to that check while everything
+ * else in the same file passes `wp->xoff + cx`:
+ *
+ *   if (wp != NULL) yoff = wp->yoff;                                  // note: no xoff
+ *   r = screen_redraw_get_visible_ranges(wp, cx - n, cy + yoff, n, NULL);
+ *   ... if (vis < n) return (1);                                      // "obscured" -> no re-emit
+ *
+ * For a pane at xoff 120, that asks whether column `cx` of the *window* is visible — a column
+ * owned by the pane to the left — concludes the cell is obscured, and drops the re-emit. Upstream
+ * fixed this after 3.7b (master now passes `xoff + cx - n`), but 3.7b is what ships today.
+ *
+ * Measured directly against tmux 3.7b with a client whose output was recorded byte for byte: a
+ * 40x20 Kitty placeholder grid printed in the left pane (xoff 0) emitted 800/800 cells complete;
+ * the identical grid in the right pane (xoff 120) emitted 800/800 cells as bare `U+10EEEE` with
+ * every row/column diacritic missing, and one `refresh-client` afterwards re-emitted all 800
+ * complete. tmux's own grid is correct throughout (`capture-pane` shows the diacritics either
+ * way), which is why any full repaint fixes it and why this workaround is just "ask for one".
+ */
+export function requestTmuxRedraw(): void {
+  if (!isInsideTmux()) {
+    return;
+  }
+  void runTmux(['refresh-client']);
+}
+
 interface RawQueryOptions<T> {
   query: string;
   timeoutMs: number;
   /** Inspect the accumulated response buffer; return a result to settle, or undefined to keep waiting. */
   tryMatch: (buffer: string) => T | undefined;
+  /**
+   * Whether to send `query` through tmux's passthrough (default true). Cell pixel size and Kitty
+   * graphics support are properties of the *real* terminal, which only passthrough can reach, so
+   * they need it. Cursor position is different: tmux tracks and answers `CSI 6n` itself, in
+   * coordinates relative to the *pane*, matching how it delivers SGR mouse reports — exactly what
+   * `queryCursorPosition` needs. Passthrough-wrapping that one instead hands the query straight to
+   * the real terminal, which has no notion of panes and answers with its own absolute on-screen
+   * position; for any pane whose horizontal offset isn't 0 (`temu split`'s right-hand pane), that
+   * silently breaks every tap (confirmed live: a real split-pane run measured `gridOrigin.col` as
+   * the pane's absolute screen column instead of ~1, so `cellToDevicePixel`'s `mouseCol -
+   * origin.col` went deeply negative and every tap clamped to the device's left edge).
+   */
+  passthrough?: boolean;
 }
 
 /**
@@ -98,7 +145,12 @@ interface RawQueryOptions<T> {
  * `tryMatch` (or `null` on timeout / when not attached to an interactive terminal). Always
  * restores stdin's mode before resolving.
  */
-function queryTerminal<T>({ query, timeoutMs, tryMatch }: RawQueryOptions<T>): Promise<T | null> {
+function queryTerminal<T>({
+  query,
+  timeoutMs,
+  tryMatch,
+  passthrough = true,
+}: RawQueryOptions<T>): Promise<T | null> {
   return new Promise((resolve) => {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
       resolve(null);
@@ -143,7 +195,11 @@ function queryTerminal<T>({ query, timeoutMs, tryMatch }: RawQueryOptions<T>): P
     }
     stdin.resume();
     stdin.on('data', onData);
-    writeToTerminal(query);
+    if (passthrough) {
+      writeToTerminal(query);
+    } else {
+      process.stdout.write(query);
+    }
   });
 }
 
@@ -173,7 +229,11 @@ export async function queryCellPixelSize(timeoutMs = 400): Promise<CellPixelSize
 }
 
 export interface CursorPosition {
-  /** 1-based, absolute within the terminal viewport (not the pane's scrollback). */
+  /**
+   * 1-based, relative to the current pane (not the whole terminal, and not the pane's
+   * scrollback) — matching the coordinate space tmux delivers SGR mouse reports in. Outside
+   * tmux, or in an unsplit pane, this coincides with the terminal's own absolute position.
+   */
   row: number;
   col: number;
 }
@@ -181,13 +241,18 @@ export interface CursorPosition {
 /**
  * Queries the cursor's current position via the standard DSR request (`CSI 6 n`), answered with
  * `CSI row ; col R`. Used to remember where a placeholder grid's top-left cell landed on screen,
- * so mouse reports (also absolute-viewport coordinates) can be translated into a position
- * relative to the grid.
+ * so mouse reports (which arrive in the same pane-relative space) can be translated into a
+ * position relative to the grid.
+ *
+ * Deliberately sent *without* tmux passthrough (`passthrough: false` — see that option's doc
+ * comment on `RawQueryOptions` for the measured bug this avoids): tmux answers this query itself,
+ * in pane-relative coordinates, which is exactly the space this value needs to be in.
  */
 export async function queryCursorPosition(timeoutMs = 400): Promise<CursorPosition | null> {
   const result = await queryTerminal<CursorPosition | null>({
     query: '\x1b[6n',
     timeoutMs,
+    passthrough: false,
     tryMatch: (buffer) => {
       // eslint-disable-next-line no-control-regex -- matching the ESC in a real terminal reply
       const match = /\x1b\[(\d+);(\d+)R/.exec(buffer);
