@@ -4,6 +4,15 @@ Display and drive an Android emulator or a booted iOS Simulator as live pixels i
 terminal — so the device sits side by side with a CLI AI agent instead of in a separate GUI
 window. Works in any terminal; tmux is entirely optional (see below).
 
+## Installation
+
+```sh
+brew install ayukatawago/tap/temu
+```
+
+This also pulls in `ffmpeg`. See [Requirements](#requirements) below for `adb`/`sim-use`/tmux,
+which are platform-specific and not installed automatically.
+
 ## Requirements
 
 - `adb` on `PATH`, with a running Android emulator or connected device — for Android targets
