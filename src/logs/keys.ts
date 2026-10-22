@@ -8,6 +8,11 @@ export interface LogKeyHandlers {
   onQuit: () => void;
   onText: (text: string) => void;
   onBackspace: () => void;
+  onDeleteForward: () => void;
+  /** -1 = left, 1 = right; moves the filter cursor without deleting anything. */
+  onCursor: (delta: -1 | 1) => void;
+  onCursorStart: () => void;
+  onCursorEnd: () => void;
   onClear: () => void;
   onDeleteWord: () => void;
   onScroll: (lines: number) => void;
@@ -100,6 +105,15 @@ export class LogKeyboard {
       case '6~':
         this.handlers.onPageDown();
         return;
+      case 'C':
+        this.handlers.onCursor(1);
+        return;
+      case 'D':
+        this.handlers.onCursor(-1);
+        return;
+      case '3~':
+        this.handlers.onDeleteForward();
+        return;
       case 'H':
       case '1~':
       case '7~':
@@ -119,6 +133,12 @@ export class LogKeyboard {
     switch (byte) {
       case 0x03: // Ctrl+C
         this.handlers.onQuit();
+        return;
+      case 0x01: // Ctrl+A
+        this.handlers.onCursorStart();
+        return;
+      case 0x05: // Ctrl+E
+        this.handlers.onCursorEnd();
         return;
       case 0x15: // Ctrl+U
         this.handlers.onClear();

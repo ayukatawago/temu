@@ -30,6 +30,8 @@ export class LogView {
   private firstSeq = 0;
   private filtered: number[] = [];
   private query = '';
+  /** Cursor position in code points (0..length), so editing never splits a character. */
+  private cursor = 0;
   private predicate: LogPredicate;
   /** Lines scrolled up from the newest filtered line; 0 means following. */
   private scrollBack = 0;
@@ -44,6 +46,7 @@ export class LogView {
     initialQuery = '',
   ) {
     this.query = initialQuery;
+    this.cursor = Array.from(initialQuery).length;
     this.predicate = parseFilter(initialQuery);
   }
 
@@ -105,22 +108,66 @@ export class LogView {
   // --- filter field -------------------------------------------------------------------------
 
   insert(text: string): void {
-    this.setQuery(this.query + text);
+    const chars = Array.from(this.query);
+    const inserted = Array.from(text);
+    chars.splice(this.cursor, 0, ...inserted);
+    this.setQuery(chars.join(''), this.cursor + inserted.length);
   }
 
   backspace(): void {
-    this.setQuery(Array.from(this.query).slice(0, -1).join(''));
+    if (this.cursor === 0) {
+      return;
+    }
+    const chars = Array.from(this.query);
+    chars.splice(this.cursor - 1, 1);
+    this.setQuery(chars.join(''), this.cursor - 1);
+  }
+
+  deleteForward(): void {
+    const chars = Array.from(this.query);
+    chars.splice(this.cursor, 1);
+    this.setQuery(chars.join(''), this.cursor);
   }
 
   clearQuery(): void {
-    this.setQuery('');
+    this.setQuery('', 0);
   }
 
+  /** Deletes the word before the cursor, leaving text after it alone. */
   deleteWord(): void {
-    this.setQuery(this.query.replace(/\s*\S*$/, ''));
+    const chars = Array.from(this.query);
+    const before = chars
+      .slice(0, this.cursor)
+      .join('')
+      .replace(/\s*\S*$/, '');
+    const keptLength = Array.from(before).length;
+    this.setQuery(before + chars.slice(this.cursor).join(''), keptLength);
   }
 
-  private setQuery(query: string): void {
+  /** Moves the cursor without touching the text; negative = left. */
+  moveCursor(delta: number): void {
+    this.setCursor(this.cursor + delta);
+  }
+
+  cursorToStart(): void {
+    this.setCursor(0);
+  }
+
+  cursorToEnd(): void {
+    this.setCursor(Array.from(this.query).length);
+  }
+
+  private setCursor(cursor: number): void {
+    const next = Math.min(Math.max(0, cursor), Array.from(this.query).length);
+    if (next !== this.cursor) {
+      this.cursor = next;
+      this.dirty = true;
+    }
+  }
+
+  private setQuery(query: string, cursor: number): void {
+    this.cursor = cursor;
+    this.dirty = true;
     if (query === this.query) {
       return;
     }
@@ -185,7 +232,21 @@ export class LogView {
     const start = Math.max(0, end - body);
 
     let out = '\x1b7\x1b[?25l';
-    out += moveTo(1, 1) + padTruncate(`filter> ${this.query}█`, this.cols);
+    // The cursor is drawn as a reverse-video cell over the character it's on (a space past the
+    // end) rather than as the real terminal cursor, which stays hidden.
+    const chars = Array.from(this.query);
+    const prefix = 'filter> ';
+    const before = chars.slice(0, this.cursor).join('');
+    const under = chars[this.cursor] ?? ' ';
+    const after = chars.slice(this.cursor + 1).join('');
+    const filterLine = `${prefix}${before}\x1b[7m${under}${RESET}${after}`;
+    // padTruncate counts the escape bytes, so pad by the visible width instead.
+    const visible = prefix.length + chars.length + (this.cursor >= chars.length ? 1 : 0);
+    out +=
+      moveTo(1, 1) +
+      (visible >= this.cols
+        ? padTruncate(`${prefix}${this.query}`, this.cols)
+        : filterLine + ' '.repeat(this.cols - visible));
     for (let i = 0; i < body; i++) {
       const seq = this.filtered[start + i];
       const entry = seq === undefined ? undefined : this.entries[seq - this.firstSeq];
@@ -203,7 +264,7 @@ export class LogView {
     const mode = this.scrollBack > 0 ? 'PAUSED' : 'FOLLOW';
     const footer =
       `${String(this.filtered.length)}/${String(this.entries.length)}  ${mode}  ` +
-      '↑↓ PgUp PgDn scroll  End:follow  Ctrl+U:clear  Ctrl+C:quit';
+      '↑↓ PgUp PgDn scroll  End:follow  ←→ edit  Ctrl+U:clear  Ctrl+C:quit';
     out += `${moveTo(this.rows, 1)}\x1b[7m${padTruncate(footer, this.cols)}${RESET}`;
     out += '\x1b8';
     process.stdout.write(out);
