@@ -17,7 +17,7 @@ const RENDER_INTERVAL_MS = 33;
 
 const LEVEL_SGR: Record<LogLevel, string> = {
   V: '\x1b[2m',
-  D: '\x1b[2m',
+  D: '\x1b[36m',
   I: '',
   W: '\x1b[33m',
   E: '\x1b[31m',
