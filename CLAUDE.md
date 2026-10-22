@@ -273,6 +273,29 @@ iOS:     sim-use stream-video --format bgra -> PassThrough -> ffmpeg (decode+cro
   (see "Platform abstraction" above), so it pays sim-use's ~0.15-0.25s per-call cost directly,
   queued through one serial queue rather than a shared shell.
 
+### Log mode (`temu --logs`)
+
+A separate session type chosen at launch (never toggled mid-session), so `temu split --logs`
+works for free via `split.ts`'s generic flag forwarding. `runStream` hands off to
+`src/logs/run.ts`'s `runLogs` right after `parseStreamArgs` — no capture/ffmpeg/renderer is
+involved, so `--renderer`/`--bitrate` are ignored.
+
+- `src/device/logcat.ts` (`LogcatSource`, `adb logcat -v threadtime -T 1`) and
+  `src/device/ios/logstream.ts` (`IosLogStreamSource`, `xcrun simctl spawn <udid> log stream
+--style ndjson`) both emit `LogEntry` (`src/logs/entry.ts`) and restart on exit like the
+  capture sources. iOS needs no `temu-ios` helper. threadtime has no package column, so
+  `LogcatSource` refreshes a pid -> name map from `ps` every 3s and the name is resolved lazily
+  (`LogContext.processName`) at display/filter time.
+- `src/logs/filter.ts` — Android-Studio-lite query (`tag:`/`package:`/`process:`/`message:`/
+  `level:`, `-` negation, bare words). Same key OR'd, different keys AND'd, negations AND'd;
+  unparseable terms degrade to bare words rather than throwing.
+- `src/logs/view.ts` — `LogView`: 10k-entry ring buffer, filtered list stored as absolute
+  sequence numbers (so ring eviction only trims the list's head), follow/paused scroll state,
+  render throttled to ~30Hz. `src/logs/keys.ts` — `LogKeyboard`, separate from `keymap.ts`
+  because every printable key is filter text here (hence quit is Ctrl+C only).
+- `resolveDeviceRef` (`src/device/target.ts`) is `resolveTarget`'s device-choosing half, so log
+  mode doesn't pay for building a full `DeviceTarget` (iOS geometry lookup).
+
 ### Entry points
 
 - `src/cli.ts` — argv dispatch only (`temu`, `temu doctor`, `temu split`/`temu tmux`); no logic of

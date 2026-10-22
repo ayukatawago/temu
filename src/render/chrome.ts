@@ -27,7 +27,7 @@ export const HELP_LINES: readonly string[] = [
   'q / Ctrl+C          quit',
 ];
 
-function moveTo(row: number, col: number): string {
+export function moveTo(row: number, col: number): string {
   return `\x1b[${String(row)};${String(col)}H`;
 }
 
@@ -43,7 +43,7 @@ export function leaveAltScreen(): void {
   process.stdout.write('\x1b[?1049l');
 }
 
-function padTruncate(text: string, width: number): string {
+export function padTruncate(text: string, width: number): string {
   if (width <= 0) return '';
   if (text.length >= width) return text.slice(0, width);
   return text + ' '.repeat(width - text.length);

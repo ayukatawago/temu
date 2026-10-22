@@ -9,7 +9,7 @@ function printUsage(): void {
   console.log('(tmux optional — only needed for `temu split`)');
   console.log('');
   console.log('Usage: temu [--device <serial|udid>] [--platform ios|android] [--bitrate <rate>]');
-  console.log('            [--renderer kitty|blocks]');
+  console.log('            [--renderer kitty|blocks] [--logs [--filter <query>]]');
   console.log('       temu doctor [--fix] [--calibrate]');
   console.log(
     '       temu split [--device <serial|udid>] [--platform ios|android] [--percent <n>]',
@@ -39,6 +39,13 @@ function printUsage(): void {
     'the lower-quality plain-text fallback. Only useful for troubleshooting — try `blocks` if',
   );
   console.log('video ever looks wrong, or `kitty` to force it despite a negative autodetection.');
+  console.log('');
+  console.log(
+    '--logs shows the device log (Android logcat / iOS Simulator unified log) instead of',
+  );
+  console.log('the screen, with a filter field on the top row. Run it in a second pane, or use');
+  console.log('`temu split --logs`. Filter terms (space-separated): tag:X  package:X  process:X');
+  console.log('message:X  level:V|D|I|W|E|A  -tag:X (negate)  and bare words (substring match).');
 }
 
 async function main(): Promise<void> {

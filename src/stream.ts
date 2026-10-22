@@ -34,6 +34,7 @@ import {
   type ZoomRegion,
 } from './render/geometry.js';
 import { KittyRenderer } from './render/kitty.js';
+import { runLogs } from './logs/run.js';
 
 export type RendererChoice = 'kitty' | 'blocks';
 
@@ -44,6 +45,10 @@ export interface StreamOptions {
   /** Explicit override for detectCaps()'s Kitty-support autodetection — see --renderer's help
    * text in cli.ts for why this needs to exist as a manual escape hatch. */
   renderer?: RendererChoice | undefined;
+  /** `--logs`: show the device's log (logcat / unified log) instead of its screen. */
+  logs: boolean;
+  /** `--filter`: initial query for the log view's filter field. */
+  filter?: string | undefined;
 }
 
 export function parseStreamArgs(argv: string[]): StreamOptions {
@@ -51,9 +56,15 @@ export function parseStreamArgs(argv: string[]): StreamOptions {
   let platform: Platform | undefined;
   let bitrate = '8M';
   let renderer: RendererChoice | undefined;
+  let logs = false;
+  let filter: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--device') {
+    if (arg === '--logs') {
+      logs = true;
+    } else if (arg === '--filter') {
+      filter = argv[++i];
+    } else if (arg === '--device') {
       device = argv[++i];
     } else if (arg === '--platform') {
       const value = argv[++i];
@@ -69,7 +80,7 @@ export function parseStreamArgs(argv: string[]): StreamOptions {
       }
     }
   }
-  return { device, platform, bitrate, renderer };
+  return { device, platform, bitrate, renderer, logs, filter };
 }
 
 const STATUS_BAR_ROWS = 1;
@@ -489,6 +500,10 @@ function setUpKeyboard(
 
 export async function runStream(argv: string[]): Promise<number> {
   const options = parseStreamArgs(argv);
+
+  if (options.logs) {
+    return runLogs(options);
+  }
 
   if (!process.stdout.isTTY) {
     console.error('temu must be run attached to a terminal (stdout is not a TTY).');

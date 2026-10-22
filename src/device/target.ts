@@ -115,20 +115,38 @@ async function scanIosCandidates(): Promise<Candidate[]> {
  *   `pickDefaultDevice`, widened across platforms).
  */
 export async function resolveTarget(device?: string, platform?: Platform): Promise<DeviceTarget> {
+  return createTarget(await resolveDeviceRef(device, platform));
+}
+
+export interface DeviceRef {
+  platform: Platform;
+  id: string;
+}
+
+function createTarget(ref: DeviceRef): Promise<DeviceTarget> {
+  return ref.platform === 'ios' ? createIosTarget(ref.id) : createAndroidTarget(ref.id);
+}
+
+/**
+ * The device-choosing half of `resolveTarget`, without building the full `DeviceTarget` — log
+ * mode only needs to know which device on which platform, and building an iOS target would also
+ * look up framebuffer geometry through the helper for no reason.
+ */
+export async function resolveDeviceRef(device?: string, platform?: Platform): Promise<DeviceRef> {
   if (device && platform) {
-    return platform === 'ios' ? createIosTarget(device) : createAndroidTarget(device);
+    return { platform, id: device };
   }
 
   if (device) {
-    return IOS_UDID_PATTERN.test(device) ? createIosTarget(device) : createAndroidTarget(device);
+    return { platform: IOS_UDID_PATTERN.test(device) ? 'ios' : 'android', id: device };
   }
 
   if (platform === 'android') {
-    return createAndroidTarget(await pickDefaultDevice());
+    return { platform, id: await pickDefaultDevice() };
   }
 
   if (platform === 'ios') {
-    return createIosTarget(await pickDefaultSimulatorUdid());
+    return { platform, id: await pickDefaultSimulatorUdid() };
   }
 
   const [androidCandidates, iosCandidates] = await Promise.all([
@@ -154,5 +172,5 @@ export async function resolveTarget(device?: string, platform?: Platform): Promi
   if (!only) {
     throw new Error('no target resolved');
   }
-  return only.platform === 'ios' ? createIosTarget(only.id) : createAndroidTarget(only.id);
+  return { platform: only.platform, id: only.id };
 }
