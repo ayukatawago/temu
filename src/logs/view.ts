@@ -7,7 +7,7 @@
 // the filtered list rather than renumbering it.
 
 import { moveTo, padTruncate } from '../render/chrome.js';
-import { formatEntry, type LogContext, type LogEntry, type LogLevel } from './entry.js';
+import { formatEntryColumns, type LogContext, type LogEntry, type LogLevel } from './entry.js';
 import { parseFilter, type LogPredicate } from './filter.js';
 
 const MAX_ENTRIES = 10_000;
@@ -258,7 +258,7 @@ export class LogView {
       out +=
         moveTo(row, 1) +
         LEVEL_SGR[entry.level] +
-        padTruncate(formatEntry(entry, this.ctx), this.cols) +
+        padTruncate(formatEntryColumns(entry, this.ctx), this.cols) +
         RESET;
     }
     const mode = this.scrollBack > 0 ? 'PAUSED' : 'FOLLOW';

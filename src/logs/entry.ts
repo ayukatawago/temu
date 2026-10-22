@@ -26,6 +26,34 @@ export interface LogContext {
   processName(entry: LogEntry): string | undefined;
 }
 
+const PROCESS_COLUMN_WIDTH = 24;
+const TAG_COLUMN_WIDTH = 24;
+
+/** Pads to `width`, or cuts to it with a `…` at the cut end (`keep` = which end survives). */
+function fitColumn(text: string, width: number, keep: 'start' | 'end'): string {
+  const chars = Array.from(text);
+  if (chars.length <= width) {
+    return text + ' '.repeat(width - chars.length);
+  }
+  return keep === 'start'
+    ? `${chars.slice(0, width - 1).join('')}…`
+    : `…${chars.slice(chars.length - (width - 1)).join('')}`;
+}
+
+/**
+ * The line as drawn: process and tag in fixed-width columns so messages all start at the same
+ * position. Process keeps its tail (the distinguishing part of a package name is the end), tag
+ * keeps its head. Truncation is display-only — the filter matches `formatEntry`'s full text.
+ */
+export function formatEntryColumns(entry: LogEntry, ctx: LogContext): string {
+  const processName = ctx.processName(entry) ?? String(entry.pid);
+  return (
+    `${entry.time} ${entry.level} ` +
+    `${fitColumn(processName, PROCESS_COLUMN_WIDTH, 'end')} ` +
+    `${fitColumn(entry.tag, TAG_COLUMN_WIDTH, 'start')} ${entry.message}`
+  );
+}
+
 export function formatEntry(entry: LogEntry, ctx: LogContext): string {
   const processName = ctx.processName(entry) ?? String(entry.pid);
   return `${entry.time} ${entry.level} ${processName} ${entry.tag}: ${entry.message}`;
